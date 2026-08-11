@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+.venv/
+venv/
+
+# voidrecon output
+loot/
+reports/
+*.json
+!package.json
+*.md.bak
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
