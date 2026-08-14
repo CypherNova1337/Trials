@@ -88,12 +88,14 @@ def _report_open(host: HostReport, entry: dict, banner: str) -> None:
     for sev, note in knowledge.match_hints(text):
         host.add(Finding(
             title=note,
-            detail=f"Matched on {svc} banner.",
+            detail=f"Inferred from the {svc} banner — confirm the exact "
+                   f"version before relying on it.",
             severity=sev,
             category="service",
             port=port,
             service=svc,
             evidence=banner[:200] if banner else None,
+            confidence="potential",
         ))
         utils.log("hot" if sev in ("critical", "high") else "warn", note, indent=2)
 
@@ -161,4 +163,5 @@ def _merge_nmap(host: HostReport, output: str) -> None:
             host.add(Finding(
                 title=note, severity=sev, category="service",
                 port=port, service=service, evidence=version,
+                confidence="potential",
             ))

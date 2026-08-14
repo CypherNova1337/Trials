@@ -61,7 +61,7 @@ def elasticsearch(host: HostReport, port: int) -> None:
     for path in ("/", "/_cat/indices?v", "/_cluster/health"):
         url = f"http://{ip}:{port}{path}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "voidrecon"})
+            req = urllib.request.Request(url, headers={"User-Agent": "scryer"})
             with urllib.request.urlopen(req, timeout=6) as resp:
                 body = resp.read(4000).decode("utf-8", "replace")
         except Exception:

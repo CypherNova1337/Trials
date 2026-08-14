@@ -1,7 +1,7 @@
-"""Command-line interface for voidrecon.
+"""Command-line interface for scryer.
 
 Usage:
-    python -m voidrecon <target> [options]
+    python -m scryer <target> [options]
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from .core import report
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="voidrecon",
+        prog="scryer",
         description="Deep, adaptive recon for CTF / lab targets (HTB, THM, etc.).",
         epilog="Only scan hosts you are explicitly authorized to test.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="use nmap -sV for service/version + OS detection if installed")
     p.add_argument("--nmap-timeout", type=int, default=300,
                    help="timeout for the nmap phase (default 300s)")
+    p.add_argument("-D", "--vhost-domain", metavar="DOMAIN",
+                   help="base domain for virtual-host brute forcing, e.g. "
+                        "'nexus.htb' (auto-derived from discovered hostnames "
+                        "if omitted)")
+    p.add_argument("--no-vhost", action="store_true",
+                   help="skip virtual-host / subdomain brute forcing")
     p.add_argument("-o", "--output", metavar="DIR",
                    help="write JSON + Markdown reports into DIR")
     p.add_argument("--no-color", action="store_true", help="disable colored output")

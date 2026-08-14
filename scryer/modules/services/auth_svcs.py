@@ -27,7 +27,7 @@ def ftp(host: HostReport, port: int) -> None:
         return
 
     try:
-        conn.login("anonymous", "anonymous@voidrecon")
+        conn.login("anonymous", "anonymous@scryer")
         utils.log("hot", "anonymous FTP login succeeded", indent=2)
         host.add(Finding(
             title="Anonymous FTP login allowed",
@@ -83,8 +83,9 @@ def ssh(host: HostReport, port: int) -> None:
         from ...data.knowledge import match_hints
         for sev, note in match_hints(banner):
             host.add(Finding(title=note, severity=sev, category="service",
-                             port=port, service="ssh", evidence=banner))
-            utils.log("warn", note, indent=2)
+                             port=port, service="ssh", evidence=banner,
+                             confidence="potential"))
+            utils.log("warn", f"{note} (potential)", indent=2)
 
     if utils.have("ssh"):
         # Ask the server which auth methods it will accept.

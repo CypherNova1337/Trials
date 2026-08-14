@@ -30,6 +30,10 @@ class Finding:
     port: Optional[int] = None
     service: Optional[str] = None
     evidence: Optional[str] = None
+    # "confirmed" = we directly observed the behaviour (a 200 with body, an
+    # anonymous login that worked). "potential" = inferred from a banner or
+    # version string and NOT verified — treat as a lead, not a fact.
+    confidence: str = "confirmed"
     data: Dict[str, Any] = field(default_factory=dict)
 
     def rank(self) -> int:
@@ -125,9 +129,11 @@ def summarize_console(host: HostReport) -> None:
         print("\n  " + c("NOTABLE FINDINGS", C.BOLD))
         for f in interesting:
             codes = SEVERITY_COLOR.get(f.severity, (C.GREY,))
-            tag = c(f"[{f.severity.upper()}]", *codes)
+            sev = f.severity.upper() + ("?" if f.confidence == "potential" else "")
+            tag = c(f"[{sev}]", *codes)
             loc = f" :{f.port}" if f.port else ""
-            print(f"  {tag} {f.title}{c(loc, C.GREY)}")
+            hint = c("  (potential — verify)", C.GREY) if f.confidence == "potential" else ""
+            print(f"  {tag} {f.title}{c(loc, C.GREY)}{hint}")
             if f.detail:
                 print(f"        {c(f.detail, C.GREY)}")
 
@@ -172,7 +178,8 @@ def to_markdown(host: HostReport, path: str) -> None:
     lines.append("")
     if ranked:
         for f in ranked:
-            lines.append(f"### [{f.severity.upper()}] {f.title}")
+            suffix = " _(potential — unverified)_" if f.confidence == "potential" else ""
+            lines.append(f"### [{f.severity.upper()}] {f.title}{suffix}")
             if f.port:
                 lines.append(f"- Port: `{f.port}`  Service: `{f.service or ''}`")
             if f.detail:

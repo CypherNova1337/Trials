@@ -15,7 +15,7 @@ from ...core.report import HostReport, Finding
 from ...data import knowledge
 
 
-_UA = "Mozilla/5.0 (compatible; voidrecon/1.0)"
+_UA = "Mozilla/5.0 (compatible; scryer/1.0)"
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _GENERATOR_RE = re.compile(
     r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', re.IGNORECASE)
@@ -108,6 +108,7 @@ def enrich(host: HostReport, port: int, secure: bool,
     pfx = f"[{vhost}] " if vhost else ""
     _headers_and_tech(host, port, headers, pfx)
     _title_and_meta(host, port, body, pfx)
+    _webapp_exploit_hint(host, port, headers, body, pfx)
     _security_headers(host, port, headers, secure)
     _redirect_hostnames(host, headers)
     _comments_and_emails(host, port, body, pfx)
@@ -130,12 +131,14 @@ def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],
                              category="web", port=port, service="http"))
             for sev, note in knowledge.match_hints(val):
                 host.add(Finding(title=note, severity=sev, category="web",
-                                 port=port, service="http", evidence=val))
+                                 port=port, service="http", evidence=val,
+                                 confidence="potential"))
     # Version hints from the server banner itself.
     for sev, note in knowledge.match_hints(server):
         host.add(Finding(title=note, severity=sev, category="web",
-                         port=port, service="http", evidence=server))
-        utils.log("warn", note, indent=2)
+                         port=port, service="http", evidence=server,
+                         confidence="potential"))
+        utils.log("warn", f"{note} (potential)", indent=2)
 
     # Interesting cookies (session frameworks leak the stack).
     cookie = headers.get("set-cookie", "")
@@ -165,7 +168,42 @@ def _title_and_meta(host: HostReport, port: int, body: str, pfx: str = "") -> No
                          category="web", port=port, service="http"))
         for sev, note in knowledge.match_hints(gen):
             host.add(Finding(title=note, severity=sev, category="web",
-                             port=port, service="http", evidence=gen))
+                             port=port, service="http", evidence=gen,
+                             confidence="potential"))
+
+
+def _webapp_exploit_hint(host: HostReport, port: int, headers: Dict[str, str],
+                         body: str, pfx: str = "") -> None:
+    """When a known web app is identified, surface an exploit-lookup lead."""
+    gen = ""
+    g = _GENERATOR_RE.search(body or "")
+    if g:
+        gen = g.group(1)
+    title = ""
+    tm = _TITLE_RE.search(body or "")
+    if tm:
+        title = tm.group(1)
+    app, version = knowledge.identify_webapp(
+        headers.get("server", ""), headers.get("x-powered-by", ""),
+        headers.get("x-generator", ""), gen, title, body or "")
+    if not app:
+        return
+    label = f"{app} {version}" if version else app
+    utils.log("good", f"web app: {label}", indent=2)
+    if version:
+        host.add(Finding(
+            title=f"{pfx}{app} {version} identified — check for public exploits",
+            detail=f"Known app + exact version. Look up known exploits/CVEs, "
+                   f"e.g. `searchsploit {app}` or search '{app} {version} "
+                   f"exploit'. Authenticated flaws often need a low-priv login.",
+            severity="medium", category="web", port=port, service="http",
+            evidence=label, confidence="potential"))
+    else:
+        host.add(Finding(
+            title=f"{pfx}{app} identified (version unknown)",
+            detail=f"Fingerprint the exact version, then check exploits/CVEs.",
+            severity="info", category="web", port=port, service="http",
+            evidence=app))
 
 
 def _security_headers(host: HostReport, port: int, headers: Dict[str, str],
@@ -229,32 +267,145 @@ def _forms(host: HostReport, port: int, body: str) -> None:
         utils.log("good", "login form present", indent=2)
 
 
-def _content_discovery(host: HostReport, port: int, base: str,
-                       vhost: Optional[str] = None) -> None:
-    """Probe a short list of high-signal paths."""
-    utils.log("info", "probing common paths", indent=1)
-    pfx = f"[{vhost}] " if vhost else ""
-    hits: List[Tuple[str, int]] = []
-    for path in knowledge.COMMON_WEB_PATHS:
-        url = f"{base}/{path}"
-        status, headers, _ = _fetch(url, timeout=5.0, method="GET", vhost=vhost)
+def _norm(body: str) -> str:
+    return re.sub(r"\s+", " ", (body or ""))[:3000]
+
+
+def _similar(a: str, a_len: int, b: str, b_len: int) -> float:
+    from difflib import SequenceMatcher
+    if not a and not b:
+        return 1.0
+    # Quick length gate before the (costlier) ratio.
+    hi = max(a_len, b_len) or 1
+    if abs(a_len - b_len) / hi > 0.4:
+        return 0.0
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _calibrate_404(base: str, vhost: Optional[str]) -> Optional[dict]:
+    """Learn how the server answers a path that certainly does not exist.
+
+    Many apps return 200 (SPA catch-all) or a fixed redirect for *every*
+    unknown path. We fetch two random paths and, crucially, compare their
+    *content* — catch-all servers echo a byte-identical page, so a real file
+    can be told apart even when its size is close. Returns None when the
+    server behaves normally (unknown -> 404) or is too dynamic to filter on.
+    """
+    import uuid
+    samples = []
+    for _ in range(2):
+        rand = uuid.uuid4().hex + ".html"
+        status, headers, body = _fetch(f"{base}/{rand}", timeout=5.0,
+                                       method="GET", vhost=vhost)
         if status is None:
             continue
-        if status in (200, 401, 403, 301, 302):
-            hits.append((path, status))
-            sev = "info"
-            cat = "web"
-            note = f"{status} /{path}"
-            # Grade the juicy ones up.
-            if status == 200 and any(x in path for x in (
-                    ".git", ".env", "config.php", "dump.sql", "backup",
-                    "phpinfo", "flag.txt", "user.txt", "swagger")):
-                sev, cat = "high", "leak"
-            elif status in (401, 403):
-                sev = "low"
-            host.add(Finding(title=f"{pfx}Path {note}", severity=sev, category=cat,
-                             port=port, service="http", evidence=url))
-            mark = "hot" if sev == "high" else ("good" if status == 200 else "dim")
-            utils.log(mark, f"{status}  /{path}", indent=2)
+        samples.append((status, _norm(body), len(body or ""),
+                        headers.get("location", "")))
+    if not samples:
+        return None
+    statuses = {s[0] for s in samples}
+    if statuses <= {404, 410}:
+        return None  # honest 404s — content discovery is trustworthy
+    if len(samples) == 2 and samples[0][0] == samples[1][0]:
+        ratio = _similar(samples[0][1], samples[0][2],
+                         samples[1][1], samples[1][2])
+    else:
+        ratio = 1.0
+    if ratio < 0.85:
+        return None  # responses vary per request — can't filter reliably
+    s = samples[0]
+    return {"status": s[0], "body": s[1], "len": s[2], "location": s[3]}
+
+
+def _is_soft404(cal: Optional[dict], status: int, body: str, body_len: int,
+                location: str) -> bool:
+    """True when a probe is indistinguishable from the catch-all baseline."""
+    if not cal or status != cal["status"]:
+        return False
+    if status in (301, 302, 307, 308):
+        return location == cal["location"]
+    # Real content differs from the catch-all page even at a similar size.
+    return _similar(_norm(body), body_len, cal["body"], cal["len"]) >= 0.9
+
+
+def _content_discovery(host: HostReport, port: int, base: str,
+                       vhost: Optional[str] = None) -> None:
+    """Probe a short list of high-signal paths, calibrated against soft-404s."""
+    utils.log("info", "probing common paths", indent=1)
+    pfx = f"[{vhost}] " if vhost else ""
+
+    cal = _calibrate_404(base, vhost)
+    if cal:
+        utils.log("dim", f"catch-all detected (unknown paths -> {cal['status']}); "
+                         f"filtering soft-404s", indent=2)
+
+    hits = 0
+    for path in knowledge.COMMON_WEB_PATHS:
+        url = f"{base}/{path}"
+        status, headers, body = _fetch(url, timeout=5.0, method="GET", vhost=vhost)
+        if status is None or status not in (200, 401, 403, 301, 302):
+            continue
+        if _is_soft404(cal, status, body or "", len(body or ""),
+                       headers.get("location", "")):
+            continue  # server answers this for everything — not a real hit
+
+        hits += 1
+        sev, cat = "info", "web"
+        note = f"{status} /{path}"
+        juicy = any(x in path for x in (
+            ".git", ".env", "config.php", "dump.sql", "backup",
+            "phpinfo", "flag.txt", "user.txt", "swagger"))
+        # Only grade a leak "high" when we actually got content back (200 with
+        # a non-empty body), not on a bare redirect or an empty 200.
+        if status == 200 and juicy and body and body.strip():
+            sev, cat = "high", "leak"
+        elif status in (401, 403):
+            sev = "low"
+        host.add(Finding(title=f"{pfx}Path {note}", severity=sev, category=cat,
+                         port=port, service="http", evidence=url))
+        mark = "hot" if sev == "high" else ("good" if status == 200 else "dim")
+        utils.log(mark, f"{status}  /{path}", indent=2)
+
+        # Exposed git repo is a foothold in itself — call it out explicitly.
+        if path == ".git/config" and status == 200 and body:
+            host.add(Finding(
+                title=f"{pfx}Exposed .git repository",
+                detail="/.git/ is web-accessible — dump it (git-dumper) to "
+                       "recover source and often committed credentials.",
+                severity="high", category="leak", port=port, service="http",
+                evidence=url))
+
+        # Pull credentials out of leaked config files.
+        if status == 200 and body and path in knowledge.SECRET_FILES:
+            _harvest_secrets(host, port, path, body, pfx)
+
     if not hits:
         utils.log("dim", "no notable paths", indent=2)
+
+
+def _harvest_secrets(host: HostReport, port: int, path: str, body: str,
+                     pfx: str) -> None:
+    seen = set()
+    for label, value, sev in knowledge.extract_secrets(body):
+        key = (label, value)
+        if key in seen:
+            continue
+        seen.add(key)
+        shown = value if len(value) <= 60 else value[:57] + "..."
+        utils.log("hot", f"{label} in /{path}: {shown}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}{label} leaked in /{path}",
+            detail=f"{label} = {shown}",
+            severity=sev, category="cred", port=port, service="http",
+            evidence=f"/{path}: {value}"))
+    # docker-compose reveals the internal service topology (extra targets).
+    if "docker-compose" in path:
+        images = re.findall(r"image:\s*([^\s]+)", body)
+        if images:
+            host.add(Finding(
+                title=f"{pfx}Internal services from {path}",
+                detail="images: " + ", ".join(sorted(set(images))[:12]),
+                severity="medium", category="leak", port=port, service="http",
+                evidence=body[:400]))
+            utils.log("good", f"compose images: {', '.join(sorted(set(images))[:6])}",
+                      indent=3)

@@ -22,7 +22,8 @@ def enrich(host: HostReport, port: int) -> None:
                              category="service", port=port, service="dns"))
             for sev, note in utils_import_hints(ver):
                 host.add(Finding(title=note, severity=sev, category="service",
-                                 port=port, service="dns", evidence=ver))
+                                 port=port, service="dns", evidence=ver,
+                                 confidence="potential"))
 
     # AXFR against any hostnames we know (domains discovered via TLS/HTTP).
     domains = _candidate_domains(host)
