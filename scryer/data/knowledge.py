@@ -114,6 +114,16 @@ COMMON_WEB_PATHS = [
     "user.flag", "root.flag", "flag.php", "flag.html",
 ]
 
+# High-value files by type (keys, credential stores, backups, dumps, captures)
+# — appended to the discovery list from the file-type knowledge base.
+try:
+    from . import filetypes as _ft
+    for _f in _ft.INTERESTING_FILENAMES:
+        if _f not in COMMON_WEB_PATHS:
+            COMMON_WEB_PATHS.append(_f)
+except Exception:  # pragma: no cover - keep discovery working if import fails
+    pass
+
 # Filenames that hold a flag/proof — when one of these returns content, scryer
 # prints the contents outright instead of just noting the path.
 FLAG_FILES = {
@@ -184,6 +194,41 @@ def extract_secrets(text: str):
         for m in pattern.finditer(text):
             value = m.group(1) if m.groups() else m.group(0)
             yield label, value.strip(), sev
+
+
+# Code-idiom secret patterns for SOURCE / backup / config files (PHP define(),
+# variable assignments, hash/array pairs) — too permissive for arbitrary HTML,
+# so only run against files scryer has classified as source/backup/config.
+_CODE_SECRETS = [
+    # define('DB_PASSWORD', 'value')  /  define("SECRET_KEY","value")
+    (re.compile(r"""(?i)define\s*\(\s*['"]([A-Za-z0-9_]*"""
+                r"""(?:pass|pwd|secret|api[_-]?key|token|passwd)[A-Za-z0-9_]*)"""
+                r"""['"]\s*,\s*['"]([^'"\n]{3,120})['"]"""), "high"),
+    # $db_password = 'value'  /  password: "value"  /  pwd => 'value'
+    (re.compile(r"""(?i)[$@]?\b([A-Za-z0-9_]*"""
+                r"""(?:passw(?:or)?d|_pass|\bpass|pwd|secret|api[_-]?key|"""
+                r"""auth[_-]?token|token)[A-Za-z0-9_]*)\b"""
+                r"""\s*(?:=>|=|:)\s*['"]([^'"\n]{3,120})['"]"""), "high"),
+]
+_PLACEHOLDER = re.compile(r"(?i)^(?:your|example|changeme|xxx+|test|password|"
+                          r"placeholder|<[^>]+>|\$\{|%[a-z]|null|none|true|false)$")
+
+
+def extract_code_secrets(text: str):
+    """Yield (label, value, severity) for credential idioms in source/config."""
+    if not text:
+        return
+    seen = set()
+    for pattern, sev in _CODE_SECRETS:
+        for m in pattern.finditer(text):
+            name, value = m.group(1), m.group(2).strip()
+            if not value or _PLACEHOLDER.match(value):
+                continue
+            key = (name.lower(), value)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield f"Credential ({name})", value, sev
 
 
 # Curated virtual-host / subdomain wordlist. On CTF boxes the real foothold
