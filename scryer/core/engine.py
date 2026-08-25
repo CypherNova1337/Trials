@@ -199,6 +199,13 @@ class Engine:
         for _ in range(3):
             names = [h for h in host.hostnames
                      if "." in h and h != host.resolved_ip and not _is_ip(h)]
+            # Safety net: never enrich a flood of vhosts (a catch-all that
+            # slipped past vhost filtering). vhost.brute already suppresses
+            # these, but keep the enrichment phase bounded regardless.
+            if len(names) > 25:
+                utils.log("warn", f"{len(names)} vhosts queued — capping "
+                                  "enrichment to first 25 (likely a catch-all)")
+                names = names[:25]
             web = [e for e in host.open_ports
                    if self._is_web(e["port"], (e.get("service") or "").lower())]
             pending = [(e, n) for e in web for n in names
