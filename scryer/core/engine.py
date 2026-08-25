@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import List
 
-from . import utils
+from . import utils, hostsfile
 from .report import HostReport, Finding
 from ..data import knowledge
 from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
@@ -67,6 +67,10 @@ class Engine:
         if not self.opts.no_vhost:
             self._vhost_brute()
 
+        # Make discovered vhosts resolvable so the external tools (and the
+        # operator's browser) work; always surface the exact /etc/hosts line.
+        self._hosts_step()
+
         # Adaptive re-pass: hostnames discovered *during* enrichment (a TLS
         # SAN, an HTTP redirect, a vhost hit) may front name-based virtual
         # hosts. Re-probe web ports with an explicit Host header for each.
@@ -93,6 +97,26 @@ class Engine:
             secure = bool(entry.get("secure")) or entry["port"] in knowledge.HTTPS_PORTS
             vhost.brute(host, entry["port"], secure,
                         domain=getattr(self.opts, "vhost_domain", None))
+
+    def _hosts_step(self) -> None:
+        names = hostsfile.vhost_names(self.host)
+        if not names:
+            return
+        ip = self.host.resolved_ip
+        cmd = hostsfile.command(ip, names)
+        if getattr(self.opts, "add_hosts", False):
+            if hostsfile.add(ip, names):
+                utils.log("good", f"added to /etc/hosts: {ip} {' '.join(names)}")
+            else:
+                utils.log("warn", f"could not edit /etc/hosts — run: {cmd}")
+        else:
+            utils.log("warn", f"add these vhosts to /etc/hosts (or use "
+                              f"--add-hosts): {utils.c(ip + ' ' + ' '.join(names), utils.C.CYAN)}")
+        self.host.add(Finding(
+            title="Virtual hosts need /etc/hosts entries",
+            detail=cmd,
+            severity="info", category="host",
+            evidence=cmd))
 
     def _ad_methodology(self) -> None:
         """If the port mix looks like an AD domain controller, drop the
@@ -142,7 +166,9 @@ class Engine:
                 self._dispatched.add(key)
 
     def _vhost_pass(self, open_ports: List[int], hostnames: List[str]) -> None:
-        """Re-probe each web port once per newly discovered hostname."""
+        """Re-probe each web port for each newly discovered hostname, running
+        the full pure-python web treatment (enrich + crawl) via Host header —
+        this is where a box like Orion actually serves its content."""
         host = self.host
         web = [e for e in host.open_ports
                if self._is_web(e["port"], (e.get("service") or "").lower())]
@@ -150,6 +176,15 @@ class Engine:
             secure = bool(entry.get("secure")) or entry["port"] in knowledge.HTTPS_PORTS
             for name in hostnames:
                 http.enrich(host, entry["port"], secure=secure, vhost=name)
+                endpoints = webcrawl.crawl(host, entry["port"], secure,
+                                           vhost=name) or []
+                if getattr(self.opts, "web_brute", False) or \
+                        getattr(self.opts, "params", False):
+                    scheme = "https" if secure else "http"
+                    # External tools need the vhost resolvable (/etc/hosts);
+                    # target it by name so they hit the right virtual host.
+                    base_url = f"{scheme}://{name}:{entry['port']}"
+                    params.discover(host, entry["port"], secure, base_url, endpoints)
 
     def _dispatch_one(self, host, port: int, svc: str) -> bool:
         try:

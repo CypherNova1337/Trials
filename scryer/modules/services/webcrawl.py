@@ -51,13 +51,31 @@ def _ctx():
     return c
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = None
+
+
+def _get_opener():
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=_ctx()))
+    return _opener
+
+
 def _get(url: str, vhost: Optional[str], timeout: float = 8.0) -> str:
+    """Fetch a URL (connecting to the target IP, optional Host header). Does
+    not follow redirects, so a vhost-redirecting base doesn't abort the crawl."""
     hdrs = {"User-Agent": _UA}
     if vhost:
         hdrs["Host"] = vhost
     try:
         req = urllib.request.Request(url, headers=hdrs)
-        with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as r:
+        with _get_opener().open(req, timeout=timeout) as r:
             return r.read(400_000).decode("utf-8", "replace")
     except Exception:
         return ""

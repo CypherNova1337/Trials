@@ -47,11 +47,19 @@ class Playbook:
 
     # -- builders -----------------------------------------------------------
     def build(self) -> "Playbook":
+        self._hosts()
         self._general()
         for entry in sorted(self.host.open_ports, key=lambda e: e["port"]):
             self._for_port(entry)
         self._from_findings()
         return self
+
+    def _hosts(self):
+        from . import hostsfile
+        names = hostsfile.vhost_names(self.host)
+        if names:
+            self.add("hosts", "map vhosts so tools + browser resolve them",
+                     hostsfile.command(self.ip, names))
 
     def _general(self):
         if not tooling.resolve("nmap"):

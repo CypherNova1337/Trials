@@ -47,6 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "'nexus.htb' (auto-derived from discovered hostnames)")
     web.add_argument("--no-vhost", action="store_true",
                      help="skip virtual-host / subdomain brute forcing")
+    web.add_argument("--add-hosts", action="store_true",
+                     help="auto-add discovered vhosts to /etc/hosts (uses sudo "
+                          "if needed) so external tools + browser resolve them")
     web.add_argument("--web-brute", action="store_true",
                      help="run a full wordlist dir brute (feroxbuster/ffuf + "
                           "SecLists) per web port — slow and loud")

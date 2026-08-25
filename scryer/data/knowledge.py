@@ -56,6 +56,7 @@ SERVICE_PROBES = {
 # Version-string heuristics. Each rule maps a compiled regex to a
 # (severity, note) hint surfaced against the matching banner/version.
 _RAW_HINTS = [
+    (r"(?i)craft ?cms", "high", "Craft CMS — check version for CVE-2023-41892 (unauth RCE) and CVE-2024-56145."),
     (r"vsftpd 2\.3\.4", "critical", "vsftpd 2.3.4 ships a well-known backdoor (CVE-2011-2523)."),
     (r"ProFTPD 1\.3\.[35]", "high", "ProFTPD 1.3.3c/1.3.5 have public RCE (mod_copy / backdoor)."),
     (r"OpenSSH [1-6]\.", "low", "Old OpenSSH — check for username enumeration / weak KEX."),
@@ -209,6 +210,7 @@ COMMON_VHOSTS = [
 # both observed, scryer surfaces a lead to check public exploits/CVEs. This is
 # a research pointer, not a claim that the box is vulnerable.
 WEBAPP_SIGNATURES = [
+    (r"(?i)craft ?cms", "Craft CMS"),
     (r"(?i)krayin", "Krayin CRM"),
     (r"(?i)pterodactyl", "Pterodactyl Panel"),
     (r"(?i)gitea", "Gitea"),

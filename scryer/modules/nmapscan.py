@@ -185,6 +185,13 @@ def _ingest_script(host: HostReport, port: int, service: str,
         for name in re.findall(r"(?:DNS:|Computer name:|FQDN:)\s*([A-Za-z0-9_.-]+)",
                                output):
             host.add_hostname(name)
+    # Any http-* script may name a vhost via a redirect URL (the classic
+    # "Did not follow redirect to http://box.htb/"). Seed it into scope.
+    for url_host in re.findall(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})", output):
+        if not re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", url_host):
+            if host.add_hostname(url_host):
+                utils.log("hot", f"vhost from nmap {sid}: "
+                                 f"{utils.c(url_host, utils.C.CYAN)}", indent=2)
     if sid == "ftp-anon" and "Anonymous FTP login allowed" in output:
         sev, cat = "high", "cred"
 
