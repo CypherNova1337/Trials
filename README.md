@@ -115,6 +115,9 @@ scryer 10.10.10.10 -p full
 # Heavy web content brute (feroxbuster/ffuf + SecLists) per web port
 scryer 10.10.10.10 --web-brute
 
+# Parameter discovery on crawled endpoints (paramvoid)
+scryer 10.10.10.10 --params
+
 # Force the pure-python scanner (no nmap)
 scryer 10.10.10.10 --no-nmap
 ```
@@ -133,6 +136,7 @@ commands for what it found, and (with `-o`) writes them to
 | `-D, --vhost-domain` | Base domain for vhost brute forcing (auto-derived if omitted) |
 | `--no-vhost` | Skip virtual-host / subdomain brute forcing |
 | `--web-brute` | Full wordlist dir brute (feroxbuster/ffuf + SecLists) per web port |
+| `--params` | paramvoid parameter discovery on crawled endpoints (implied by `--web-brute`) |
 | `--no-searchsploit` | Skip the searchsploit exploit-lookup phase |
 | `-o, --output DIR` | Write JSON + Markdown + `commands.sh` into `DIR` |
 | `-t/-w/--nmap-timeout` | Tune python-scan timeout/threads and the nmap phase timeout |
@@ -150,8 +154,19 @@ scryer orchestrates these when present and falls back to python when not.
 Run `scryer --toolcheck` for the live list. The recommended kit:
 
 `nmap` · `rustscan` · `ffuf` · `feroxbuster` · `whatweb` · `nikto` ·
-`enum4linux-ng` · `netexec` · `smbclient` · `ldapsearch` · `snmpwalk` ·
-`showmount` · `rsync` · `kerbrute` · `impacket` · `searchsploit` · `seclists`
+`paramvoid` · `enum4linux-ng` · `netexec` · `smbclient` · `ldapsearch` ·
+`snmpwalk` · `showmount` · `rsync` · `kerbrute` · `impacket` · `searchsploit`
+· `seclists`
+
+### Wordlists & paramvoid
+
+- **SecLists** is auto-detected from (first hit wins): `~/Documents/Wordlists/SecLists`,
+  `$SCRYER_SECLISTS`, `/usr/share/seclists`, `/usr/share/wordlists/seclists`,
+  `~/SecLists`. Override with `SCRYER_SECLISTS=/path scryer …`.
+- **Parameter discovery** uses [paramvoid](https://github.com/CypherNova1337/paramvoid)
+  (not arjun). It's resolved from `$PATH`, `~/go/bin/paramvoid`, or
+  `~/Tools/paramvoid/paramvoid`; install with
+  `go install github.com/CypherNova1337/paramvoid@latest`.
 
 ## Project layout
 

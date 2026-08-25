@@ -16,7 +16,7 @@ from ..data import knowledge
 from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
-    snmp, mail, netshares, sqldb, remote, webcrawl)
+    snmp, mail, netshares, sqldb, remote, webcrawl, params)
 
 
 class Engine:
@@ -161,9 +161,14 @@ class Engine:
                     tls.enrich(host, port)
                 http.enrich(host, port, secure=secure)
                 webcrawl.whatweb(host, port, secure)
-                webcrawl.crawl(host, port, secure)
+                endpoints = webcrawl.crawl(host, port, secure) or []
                 if getattr(self.opts, "web_brute", False):
                     webcrawl.dir_brute(host, port, secure)
+                if getattr(self.opts, "web_brute", False) or \
+                        getattr(self.opts, "params", False):
+                    scheme = "https" if secure else "http"
+                    base_url = f"{scheme}://{host.resolved_ip}:{port}"
+                    params.discover(host, port, secure, base_url, endpoints)
                 return True
 
             if secure or port in (443, 8443) or "ssl" in svc:

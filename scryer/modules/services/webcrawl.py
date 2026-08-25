@@ -113,6 +113,8 @@ def crawl(host: HostReport, port: int, secure: bool,
             detail=shown[:400],
             severity="low", category="web", port=port, service="http",
             evidence="\n".join(interesting[:80])))
+    # Return endpoints so callers (e.g. paramvoid) can target them.
+    return interesting
 
 
 def _scrape_js_secrets(host, port, url, body, vhost):

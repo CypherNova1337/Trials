@@ -32,6 +32,12 @@ class ExtTool:
 
     def resolve(self) -> Optional[str]:
         for cand in (self.name, *self.alts):
+            # Absolute / ~-prefixed candidates: accept a direct executable file.
+            if cand.startswith("/") or cand.startswith("~"):
+                ep = os.path.expanduser(cand)
+                if os.path.isfile(ep) and os.access(ep, os.X_OK):
+                    return ep
+                continue
             path = shutil.which(cand)
             if path:
                 return path
@@ -56,7 +62,12 @@ REGISTRY: List[ExtTool] = [
     ExtTool("whatweb", "web tech fingerprinting", apt="whatweb", essential=True),
     ExtTool("nikto", "web server vuln scanning", apt="nikto"),
     ExtTool("wpscan", "WordPress scanning", apt="wpscan"),
-    ExtTool("arjun", "HTTP parameter discovery", pipx="arjun"),
+    # paramvoid is the operator's own parameter-discovery tool (replaces arjun).
+    ExtTool("paramvoid", "HTTP parameter discovery",
+            go="github.com/CypherNova1337/paramvoid@latest",
+            alts=["~/go/bin/paramvoid", "~/Tools/paramvoid/paramvoid",
+                  "~/Tools/paramvoid/paramvoid.bin"],
+            essential=True),
     ExtTool("katana", "fast web crawler", go="github.com/projectdiscovery/katana/cmd/katana@latest"),
     # --- SMB / AD / Windows ---
     ExtTool("enum4linux-ng", "SMB/LDAP AD enumeration",
@@ -103,8 +114,18 @@ def find_wordlist(kind: str) -> Optional[str]:
 
     kind: 'dir' | 'vhost' | 'dns' | 'passwords' | 'users'
     """
-    roots = ["/usr/share/seclists", "/usr/share/wordlists/seclists",
-             os.path.expanduser("~/SecLists")]
+    # Operator's SecLists location first, then env override, then the usual
+    # Kali/packaged paths.
+    roots = [
+        os.path.expanduser("~/Documents/Wordlists/SecLists"),
+        os.environ.get("SCRYER_SECLISTS", ""),
+        "/usr/share/seclists",
+        "/usr/share/wordlists/seclists",
+        os.path.expanduser("~/Documents/Wordlists/seclists"),
+        os.path.expanduser("~/SecLists"),
+        os.path.expanduser("~/wordlists/SecLists"),
+    ]
+    roots = [os.path.expanduser(r) for r in roots if r]
     candidates = {
         "dir": ["Discovery/Web-Content/raft-medium-directories.txt",
                 "Discovery/Web-Content/directory-list-2.3-medium.txt",
@@ -114,6 +135,8 @@ def find_wordlist(kind: str) -> Optional[str]:
                   "Discovery/DNS/namelist.txt"],
         "dns": ["Discovery/DNS/subdomains-top1million-5000.txt",
                 "Discovery/DNS/namelist.txt"],
+        "params": ["Discovery/Web-Content/burp-parameter-names.txt",
+                   "Discovery/Web-Content/api/objects.txt"],
         "passwords": ["Passwords/Common-Credentials/10-million-password-list-top-1000.txt",
                       "Passwords/Common-Credentials/best110.txt",
                       "rockyou.txt"],
