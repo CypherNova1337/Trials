@@ -157,18 +157,21 @@ def _scrape_js_secrets(host, port, url, body, vhost):
             evidence=f"{url}: {value}"))
 
 
-def whatweb(host: HostReport, port: int, secure: bool) -> None:
-    """Run whatweb and ingest a concise fingerprint line when installed."""
+def whatweb(host: HostReport, port: int, secure: bool, vhost=None) -> None:
+    """Run whatweb and ingest a concise fingerprint line when installed. When a
+    vhost is given, target it by name (needs it resolvable via /etc/hosts)."""
     ww = tooling.resolve("whatweb")
     if not ww:
         return
     scheme = "https" if secure else "http"
-    url = f"{scheme}://{host.resolved_ip}:{port}"
+    url = f"{scheme}://{vhost or host.resolved_ip}:{port}"
     rc, out, _ = utils.run([ww, "-a", "3", "--no-errors", url], timeout=60)
     line = (out or "").strip().splitlines()[0] if out.strip() else ""
     if line:
-        utils.log("good", f"whatweb: {line[:120]}", indent=1)
-        host.add(Finding(title="whatweb fingerprint", detail=line[:400],
+        pfx = f"[{vhost}] " if vhost else ""
+        utils.log("good", f"whatweb{(' ' + vhost) if vhost else ''}: {line[:120]}",
+                  indent=1)
+        host.add(Finding(title=f"{pfx}whatweb fingerprint", detail=line[:400],
                          severity="info", category="web", port=port,
                          service="http", evidence=out[:800]))
 

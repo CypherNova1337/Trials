@@ -19,11 +19,17 @@ from ..modules.services import (
     snmp, mail, netshares, sqldb, remote, webcrawl, params)
 
 
+def _is_ip(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
 class Engine:
     def __init__(self, target: str, opts) -> None:
         self.opts = opts
         self.host = HostReport(target=target)
         self._dispatched: set = set()
+        self._web_enriched: set = set()   # (port, vhost) already web-enriched
 
     # -- phases -------------------------------------------------------------
     def run(self) -> HostReport:
@@ -60,7 +66,6 @@ class Engine:
             fingerprint.refine(host, timeout=max(self.opts.timeout, 4.0))
 
         # First deep pass over discovered services.
-        before = set(host.hostnames)
         self._dispatch(open_ports)
 
         # Virtual-host brute forcing — the usual foothold on hard web boxes.
@@ -71,13 +76,11 @@ class Engine:
         # operator's browser) work; always surface the exact /etc/hosts line.
         self._hosts_step()
 
-        # Adaptive re-pass: hostnames discovered *during* enrichment (a TLS
-        # SAN, an HTTP redirect, a vhost hit) may front name-based virtual
-        # hosts. Re-probe web ports with an explicit Host header for each.
-        discovered = [h for h in host.hostnames if h not in before]
-        if discovered:
-            utils.log("info", f"virtual-host pass for: {', '.join(discovered)}")
-            self._vhost_pass(open_ports, discovered)
+        # Enrich EVERY known virtual host on the web ports (bounded, deduped).
+        # A box like Orion serves nothing on the bare IP and everything behind
+        # a vhost it reveals via a redirect / nmap http-title — this is where
+        # that content actually gets scanned.
+        self._enrich_vhosts()
 
         self._ad_methodology()
         self._os_inference()
@@ -165,26 +168,48 @@ class Engine:
             if handled:
                 self._dispatched.add(key)
 
-    def _vhost_pass(self, open_ports: List[int], hostnames: List[str]) -> None:
-        """Re-probe each web port for each newly discovered hostname, running
-        the full pure-python web treatment (enrich + crawl) via Host header —
-        this is where a box like Orion actually serves its content."""
+    def _web_enrich(self, port: int, secure: bool, vhost=None) -> None:
+        """Full web treatment for one (port, vhost): TLS, HTTP enrich, whatweb,
+        crawl, optional dir-brute + paramvoid. Deduped via _web_enriched so a
+        vhost learned by several routes is only scanned once."""
         host = self.host
-        web = [e for e in host.open_ports
-               if self._is_web(e["port"], (e.get("service") or "").lower())]
-        for entry in web:
-            secure = bool(entry.get("secure")) or entry["port"] in knowledge.HTTPS_PORTS
-            for name in hostnames:
-                http.enrich(host, entry["port"], secure=secure, vhost=name)
-                endpoints = webcrawl.crawl(host, entry["port"], secure,
-                                           vhost=name) or []
-                if getattr(self.opts, "web_brute", False) or \
-                        getattr(self.opts, "params", False):
-                    scheme = "https" if secure else "http"
-                    # External tools need the vhost resolvable (/etc/hosts);
-                    # target it by name so they hit the right virtual host.
-                    base_url = f"{scheme}://{name}:{entry['port']}"
-                    params.discover(host, entry["port"], secure, base_url, endpoints)
+        key = (port, vhost)
+        if key in self._web_enriched:
+            return
+        self._web_enriched.add(key)
+
+        if secure and vhost is None:
+            tls.enrich(host, port)
+        http.enrich(host, port, secure=secure, vhost=vhost)
+        webcrawl.whatweb(host, port, secure, vhost=vhost)
+        endpoints = webcrawl.crawl(host, port, secure, vhost=vhost) or []
+        if getattr(self.opts, "web_brute", False):
+            webcrawl.dir_brute(host, port, secure, vhost=vhost)
+        if getattr(self.opts, "web_brute", False) or getattr(self.opts, "params", False):
+            scheme = "https" if secure else "http"
+            # Target the vhost by name so external tools (needing /etc/hosts)
+            # hit the right virtual host; the bare IP otherwise.
+            base_url = f"{scheme}://{vhost or host.resolved_ip}:{port}"
+            params.discover(host, port, secure, base_url, endpoints)
+
+    def _enrich_vhosts(self) -> None:
+        """Enrich every known virtual host on every web port. Runs in bounded
+        passes so a vhost that itself reveals more vhosts still gets covered."""
+        host = self.host
+        for _ in range(3):
+            names = [h for h in host.hostnames
+                     if "." in h and h != host.resolved_ip and not _is_ip(h)]
+            web = [e for e in host.open_ports
+                   if self._is_web(e["port"], (e.get("service") or "").lower())]
+            pending = [(e, n) for e in web for n in names
+                       if (e["port"], n) not in self._web_enriched]
+            if not pending:
+                break
+            names_here = sorted({n for _e, n in pending})
+            utils.log("info", f"virtual-host enrichment: {', '.join(names_here)}")
+            for entry, name in pending:
+                secure = bool(entry.get("secure")) or entry["port"] in knowledge.HTTPS_PORTS
+                self._web_enrich(entry["port"], secure, vhost=name)
 
     def _dispatch_one(self, host, port: int, svc: str) -> bool:
         try:
@@ -192,18 +217,7 @@ class Engine:
             secure = bool(entry.get("secure")) if entry else False
             if self._is_web(port, svc):
                 secure = secure or port in knowledge.HTTPS_PORTS or "https" in svc
-                if secure:
-                    tls.enrich(host, port)
-                http.enrich(host, port, secure=secure)
-                webcrawl.whatweb(host, port, secure)
-                endpoints = webcrawl.crawl(host, port, secure) or []
-                if getattr(self.opts, "web_brute", False):
-                    webcrawl.dir_brute(host, port, secure)
-                if getattr(self.opts, "web_brute", False) or \
-                        getattr(self.opts, "params", False):
-                    scheme = "https" if secure else "http"
-                    base_url = f"{scheme}://{host.resolved_ip}:{port}"
-                    params.discover(host, port, secure, base_url, endpoints)
+                self._web_enrich(port, secure, vhost=None)
                 return True
 
             if secure or port in (443, 8443) or "ssl" in svc:
