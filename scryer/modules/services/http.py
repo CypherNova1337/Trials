@@ -66,27 +66,58 @@ def _ctx() -> ssl.SSLContext:
     return ctx
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Return 3xx responses instead of following them.
+
+    Critical for recon: CTF boxes commonly redirect the bare IP to a vhost
+    (http://10.10.10.10/ -> http://box.htb/). Following that blindly makes the
+    request fail when the vhost isn't in /etc/hosts — and buries the very
+    hostname we most need. We keep the 3xx so its Location header is captured.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = None
+
+
+def _get_opener():
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=_ctx()))
+    return _opener
+
+
 def _fetch(url: str, timeout: float = 8.0, method: str = "GET",
            vhost: Optional[str] = None):
     """Return (status, headers-dict, body-str) or (None, {}, '') on error.
 
-    When *vhost* is set, the request is sent with an explicit Host header so
-    name-based virtual hosts serve their real content.
+    Redirects are NOT followed — a 3xx is returned with its headers so the
+    caller can read the Location (and any vhost it reveals). When *vhost* is
+    set, the request is sent with an explicit Host header so name-based virtual
+    hosts serve their real content.
     """
     hdrs = {"User-Agent": _UA}
     if vhost:
         hdrs["Host"] = vhost
     req = urllib.request.Request(url, method=method, headers=hdrs)
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_ctx()) as resp:
+        with _get_opener().open(req, timeout=timeout) as resp:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             body = b""
             if method == "GET":
                 body = resp.read(200_000)
-            return resp.status, headers, body.decode("utf-8", "replace")
+            status = getattr(resp, "status", None) or resp.getcode()
+            return status, headers, body.decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
-        return exc.code, headers, ""
+        body = b""
+        try:
+            body = exc.read(200_000)
+        except Exception:
+            pass
+        return exc.code, headers, body.decode("utf-8", "replace")
     except Exception:
         return None, {}, ""
 
@@ -110,7 +141,7 @@ def enrich(host: HostReport, port: int, secure: bool,
     _title_and_meta(host, port, body, pfx)
     _webapp_exploit_hint(host, port, headers, body, pfx)
     _security_headers(host, port, headers, secure)
-    _redirect_hostnames(host, headers)
+    _redirect_hostnames(host, port, headers)
     _comments_and_emails(host, port, body, pfx)
     scan_body_for_flags(host, port, base + "/", body, pfx)
     _forms(host, port, body)
@@ -239,12 +270,31 @@ def _security_headers(host: HostReport, port: int, headers: Dict[str, str],
         ))
 
 
-def _redirect_hostnames(host: HostReport, headers: Dict[str, str]) -> None:
+def _redirect_hostnames(host: HostReport, port: int, headers: Dict[str, str]) -> None:
     loc = headers.get("location", "")
     m = re.search(r"https?://([^/:]+)", loc)
-    if m and host.add_hostname(m.group(1)):
-        utils.log("good", f"redirect reveals hostname: "
-                          f"{utils.c(m.group(1), utils.C.CYAN)}", indent=2)
+    if not m:
+        return
+    name = m.group(1)
+    if _looks_like_ip(name):
+        return
+    is_new = host.add_hostname(name)
+    if is_new:
+        utils.log("hot", f"redirect reveals vhost: "
+                         f"{utils.c(name, utils.C.CYAN, utils.C.BOLD)} "
+                         f"-> will re-probe with Host: {name}", indent=2)
+        host.add(Finding(
+            title=f"Redirect reveals virtual host: {name}",
+            detail=f"The site redirects to {loc.strip()} — add "
+                   f"'{host.resolved_ip} {name}' to /etc/hosts, then this name "
+                   f"fronts the real content (scryer re-probes it automatically).",
+            severity="medium", category="host", port=port, service="http",
+            evidence=loc.strip()))
+
+
+def _looks_like_ip(name: str) -> bool:
+    parts = name.split(".")
+    return len(parts) == 4 and all(p.isdigit() for p in parts)
 
 
 def _comments_and_emails(host: HostReport, port: int, body: str,

@@ -135,6 +135,7 @@ commands for what it found, and (with `-o`) writes them to
 | `--no-nmap` | Force the pure-python scanner even if nmap is present |
 | `-D, --vhost-domain` | Base domain for vhost brute forcing (auto-derived if omitted) |
 | `--no-vhost` | Skip virtual-host / subdomain brute forcing |
+| `--add-hosts` | Auto-add discovered vhosts (e.g. from an IP→`box.htb` redirect) to `/etc/hosts` so external tools + your browser resolve them |
 | `--web-brute` | Full wordlist dir brute (feroxbuster/ffuf + SecLists) per web port |
 | `--params` | paramvoid parameter discovery on crawled endpoints (implied by `--web-brute`) |
 | `--no-searchsploit` | Skip the searchsploit exploit-lookup phase |
