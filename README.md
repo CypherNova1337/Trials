@@ -1,9 +1,9 @@
-# voidrecon
+# scryer
 
 **Deep, adaptive recon toolkit for CTF and lab environments** (Hack The Box,
 TryHackMe, VulnHub, OSCP-style boxes).
 
-`voidrecon` is a single-shot enumeration tool that goes wide *and* deep on a
+`scryer` is a single-shot enumeration tool that goes wide *and* deep on a
 target. Point it at a box and it resolves the host, scans ports, fingerprints
 every service it finds, and then fires service-specific deep modules that pull
 out the kind of information you actually pivot on: banners and versions, web
@@ -12,25 +12,40 @@ logins, unauthenticated datastores, DNS zone transfers, and more.
 
 It is **adaptive**: what it discovers in one phase drives the next. A hostname
 found in a TLS certificate is fed back in and re-probed as a virtual host. A
-version banner is matched against a knowledge base of well-known weaknesses.
-Everything is collected into a single structured report you can read on the
-console or export to JSON / Markdown.
+leaked `.env` is parsed for database credentials. A web app plus its exact
+version becomes an exploit-lookup lead. Everything is collected into a single
+structured report you can read on the console or export to JSON / Markdown.
+
+It is also **honest about certainty**. Anything scryer directly observed (a
+config file that returned its contents, an anonymous login that worked) is
+marked `confirmed`; anything merely inferred from a banner or version string
+is marked `potential — verify` and never dressed up as a confirmed finding.
 
 ---
 
 ## Highlights
 
-- **Everything from one command** — no juggling ten tools and copy-pasting IPs.
-- **Adaptive dispatch** — deep modules run only for the services that are
-  actually open, and re-run when new hostnames surface.
-- **Pure standard library core** — the scanner, web, TLS, FTP, SSH and
-  datastore modules all run with nothing but Python 3.8+. External tools
-  (`nmap`, `smbclient`, `rpcclient`, `dig`, `mongosh`) are used automatically
-  *when present* and skipped cleanly when not.
-- **Signal over noise** — findings are graded by severity so the interesting
-  stuff floats to the top of the summary.
-- **Portable reports** — colorized console output plus optional JSON and
-  Markdown exports for your notes / write-ups.
+- **Orchestrator, not another silo** — for every job scryer drives the best
+  real tool on the box (nmap, rustscan, ffuf/feroxbuster, whatweb,
+  enum4linux-ng, netexec, snmpwalk, searchsploit …) and falls back to a
+  pure-python implementation only when that tool is missing. Fast and deep on
+  Kali, never dead on a bare shell.
+- **`--toolcheck` / `--install`** — audits your kit and installs whatever is
+  missing via the detected package manager, so a fresh box is ready in one line.
+- **Finds the hidden foothold** — virtual-host / subdomain brute forcing with
+  automatic soft-404 filtering, the way real boxes hide `git.`, `dev.` and
+  `admin.` behind a default server block.
+- **Pulls the loot** — extracts DB credentials, API keys, tokens and private
+  keys from leaked `.env`, `docker-compose.yml`, `.git/config` and config
+  files, **and from JavaScript**; enumerates AD over anonymous LDAP; walks SNMP.
+- **Tells you what to type next** — every finding turns into a copy-paste
+  command tuned to your installed tools (dir brute, share enum, AS-REP roast,
+  searchsploit), printed at the end and saved to `commands.sh`.
+- **Accurate by construction** — active protocol fingerprinting (not port-number
+  guessing), content-similarity soft-404 detection (not blind size filtering),
+  and a `confirmed` / `potential` confidence split on every finding.
+- **Portable reports** — colorized console output plus JSON, Markdown and a
+  runnable command script.
 
 ## What it collects
 
@@ -38,90 +53,127 @@ console or export to JSON / Markdown.
 |-------------|----------------------|
 | Host        | Resolution, reverse DNS, liveness, OS inference from service mix |
 | Ports       | Threaded TCP connect scan, banner grabbing, version extraction |
-| HTTP(S)     | Status, server/tech headers, page title, generator meta, framework cookies, security-header gaps, login forms, interesting HTML comments, email/username leaks, content discovery on high-signal paths (`.git`, `.env`, backups, `swagger`, `flag.txt`, …), virtual-host re-probing |
+| Fingerprint | Active protocol probe — real HTTP/HTTPS/TLS/SSH/FTP detection regardless of port number |
+| HTTP(S)     | Status, server/tech headers, page title, generator meta, framework cookies, security-header gaps, login forms, interesting HTML comments, email/username leaks |
+| Web discovery | High-signal path probing (`.git`, `.env`, backups, `swagger`, …) with **content-similarity soft-404 filtering** so catch-all servers don't produce false hits |
+| Secrets     | Credential/key extraction from leaked `.env`, `docker-compose.yml`, `.git/config`, `wp-config.php`, `*.sql` (DB creds, API keys, AWS keys, private keys, connection strings) + internal service topology from compose files |
+| VHosts      | **Host-header brute forcing** against a subdomain wordlist, default-server catch-all detection, discovered vhosts fed back and re-enriched |
+| Web crawl   | Same-origin crawl + **JavaScript scraping** for API endpoints and hard-coded secrets; `whatweb` fingerprint; optional full `feroxbuster`/`ffuf` dir brute |
+| Web apps    | Fingerprints known apps (Gitea, WordPress, Jenkins, Krayin, Pterodactyl, …) + version and surfaces an exploit/CVE-lookup lead |
 | TLS         | Protocol/cipher, subject CN, SANs (fed back as new hostnames), issuer, expiry, weak-protocol flags |
 | DNS         | `version.bind`, AXFR zone-transfer attempts |
-| SMB         | NetBIOS names, null-session share listing + read checks, RPC user enumeration |
-| FTP         | Anonymous login, directory listing, interesting files |
-| SSH         | Banner, supported auth methods, password-auth flag |
+| SMB         | NetBIOS names, null-session share listing + read checks, RPC user enumeration (enum4linux-ng / netexec when present) |
+| LDAP / AD   | Anonymous bind, naming context / domain, user enumeration, DC detection + AD attack-path methodology (AS-REP roast, Kerberoast, BloodHound) |
+| SNMP        | Community-string check + walk of processes / software / listening ports / users (snmpwalk, with a raw-socket fallback) |
+| SMTP        | Banner, capabilities, VRFY/EXPN user-enumeration vector detection |
+| NFS / rsync | Export and module listing (world-readable shares) |
+| SQL DBs     | MySQL / MSSQL / PostgreSQL version + safe default-credential probe |
+| Remote      | RDP (NLA/NTLM info), VNC (auth/version), WinRM methodology |
+| FTP / SSH   | Anonymous login, directory listing; SSH auth methods / password-auth flag |
 | Datastores  | Unauthenticated Redis / Elasticsearch / MongoDB / Memcached checks |
+| Exploit intel | Runs `searchsploit` on every identified product+version and folds hits back in |
+| Next steps  | Per-service copy-paste command playbook written to `commands.sh` |
 | Versions    | Banner matching against a built-in weakness knowledge base |
 
 ## Install
 
-No dependencies required for the core.
+The core needs no dependencies.
 
 ```bash
 git clone https://github.com/CypherNova1337/Trials
 cd Trials
-python3 -m voidrecon --help
+python3 -m scryer --help          # run in place
+# or install as a command:
+pip install .
+scryer --help
 ```
 
-Optionally install it as a command:
+### First run: check your kit
 
 ```bash
-pip install .
-voidrecon --help
+scryer --toolcheck                # audit installed tools
+sudo scryer --toolcheck --install # install everything missing
 ```
+
+scryer runs fine with nothing installed, but the more of the kit it finds, the
+faster and deeper it goes. `--toolcheck` shows exactly what is present, what is
+missing, and how each missing tool would be installed.
 
 ## Usage
 
 ```bash
-# Fast default: curated top-ports scan + full enrichment
-python3 -m voidrecon 10.10.10.10
+# Default: nmap/rustscan if present (python scanner otherwise) + full enrichment
+scryer 10.10.10.10
 
-# Specific ports / ranges
-python3 -m voidrecon target.htb -p 22,80,443,8000-8100
+# Live CTF one-liner: brute vhosts, scan UDP too, save everything
+scryer 10.10.10.10 -D box.htb --udp -o loot/
 
-# Full 65k port sweep
-python3 -m voidrecon 10.10.10.10 -p full
+# Specific ports / full sweep
+scryer target.htb -p 22,80,443,8000-8100
+scryer 10.10.10.10 -p full
 
-# Add nmap -sV service + OS detection when nmap is installed
-python3 -m voidrecon 10.10.10.10 --nmap
+# Heavy web content brute (feroxbuster/ffuf + SecLists) per web port
+scryer 10.10.10.10 --web-brute
 
-# Save JSON + Markdown reports
-python3 -m voidrecon 10.10.10.10 -o loot/
-
-# Just the summary, no phase chatter
-python3 -m voidrecon 10.10.10.10 -q
+# Force the pure-python scanner (no nmap)
+scryer 10.10.10.10 --no-nmap
 ```
+
+At the end of every run scryer prints a **Next steps** block of copy-paste
+commands for what it found, and (with `-o`) writes them to
+`<target>.commands.sh` alongside the JSON and Markdown reports.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
 | `-p, --ports` | `top` (default), `full`, or a list like `22,80,443,8000-8100` |
-| `-t, --timeout` | Per-port connect timeout (default `1.5s`) |
-| `-w, --workers` | Concurrent scan threads (default `200`) |
-| `--nmap` | Use `nmap -sV` for service/version + OS detection if installed |
-| `--nmap-timeout` | Timeout for the nmap phase (default `300s`) |
-| `-o, --output DIR` | Write `<target>.json` and `<target>.md` into `DIR` |
-| `-q, --quiet` | Print only the final summary |
+| `--udp` | Also scan top UDP ports (nmap; needs root for accuracy) |
+| `--no-nmap` | Force the pure-python scanner even if nmap is present |
+| `-D, --vhost-domain` | Base domain for vhost brute forcing (auto-derived if omitted) |
+| `--no-vhost` | Skip virtual-host / subdomain brute forcing |
+| `--web-brute` | Full wordlist dir brute (feroxbuster/ffuf + SecLists) per web port |
+| `--no-searchsploit` | Skip the searchsploit exploit-lookup phase |
+| `-o, --output DIR` | Write JSON + Markdown + `commands.sh` into `DIR` |
+| `-t/-w/--nmap-timeout` | Tune python-scan timeout/threads and the nmap phase timeout |
+| `-q, --quiet` | Print only the summary + next steps |
 | `--no-color` | Disable ANSI colors |
+| `--toolcheck [--install]` | Audit (and optionally install) external tools, then exit |
 
-## Optional external tools
+> **Tip:** on Hack The Box, add the box's domain to `/etc/hosts` and pass it
+> with `-D` (e.g. `-D nexus.htb`) so scryer can brute-force the virtual hosts
+> that usually hide the real foothold.
 
-`voidrecon` auto-detects and uses these when they are on your `PATH`; none are
-required:
+## External tools
 
-`nmap` · `smbclient` · `nmblookup` · `rpcclient` · `dig` / `host` ·
-`mongosh` / `mongo` · `ping`
+scryer orchestrates these when present and falls back to python when not.
+Run `scryer --toolcheck` for the live list. The recommended kit:
+
+`nmap` · `rustscan` · `ffuf` · `feroxbuster` · `whatweb` · `nikto` ·
+`enum4linux-ng` · `netexec` · `smbclient` · `ldapsearch` · `snmpwalk` ·
+`showmount` · `rsync` · `kerbrute` · `impacket` · `searchsploit` · `seclists`
 
 ## Project layout
 
 ```
-voidrecon/
+scryer/
 ├── __main__.py          # CLI
 ├── core/
-│   ├── engine.py        # adaptive orchestrator
-│   ├── report.py        # findings model + console/JSON/Markdown reporters
+│   ├── engine.py        # adaptive orchestrator + AD methodology inference
+│   ├── tooling.py       # external-tool registry + --toolcheck / --install
+│   ├── playbook.py      # per-service copy-paste next-step generation
+│   ├── report.py        # findings model (confidence-aware) + reporters
 │   └── utils.py         # colors, logging, external-tool runner
 ├── data/
-│   └── knowledge.py     # port map, probes, version-weakness rules, wordlist
+│   └── knowledge.py     # ports, probes, weakness rules, vhost + secret rules
 └── modules/
     ├── discovery.py     # resolution + liveness
-    ├── ports.py         # scanner + banner grab + optional nmap
-    └── services/        # http, tls, dns, smb, auth_svcs, datastores
+    ├── ports.py         # pure-python scanner + banner grab
+    ├── nmapscan.py      # nmap/rustscan orchestration + NSE ingestion
+    ├── fingerprint.py   # active protocol identification
+    ├── exploitintel.py  # searchsploit lookups
+    └── services/        # http, webcrawl, tls, dns, smb, ldap, vhost, snmp,
+                         #   mail, netshares, sqldb, remote, auth_svcs, datastores
 ```
 
 ## Legal / ethics

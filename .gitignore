@@ -9,7 +9,7 @@ dist/
 .venv/
 venv/
 
-# voidrecon output
+# scryer output
 loot/
 reports/
 *.json
