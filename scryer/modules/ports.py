@@ -11,7 +11,7 @@ from __future__ import annotations
 import concurrent.futures
 import re
 import socket
-from typing import Iterable, List, Optional
+from typing import Iterable, List
 
 from ..core import utils
 from ..core.report import HostReport, Finding

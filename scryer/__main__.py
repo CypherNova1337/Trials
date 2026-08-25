@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--web-brute", action="store_true",
                      help="run a full wordlist dir brute (feroxbuster/ffuf + "
                           "SecLists) per web port — slow and loud")
+    web.add_argument("--params", action="store_true",
+                     help="run paramvoid parameter discovery on web endpoints "
+                          "(implied by --web-brute)")
 
     out = p.add_argument_group("output")
     out.add_argument("-o", "--output", metavar="DIR",

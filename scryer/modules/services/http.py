@@ -8,7 +8,7 @@ import ssl
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from ...core import utils
 from ...core.report import HostReport, Finding
@@ -221,7 +221,7 @@ def _webapp_exploit_hint(host: HostReport, port: int, headers: Dict[str, str],
     else:
         host.add(Finding(
             title=f"{pfx}{app} identified (version unknown)",
-            detail=f"Fingerprint the exact version, then check exploits/CVEs.",
+            detail="Fingerprint the exact version, then check exploits/CVEs.",
             severity="info", category="web", port=port, service="http",
             evidence=app))
 

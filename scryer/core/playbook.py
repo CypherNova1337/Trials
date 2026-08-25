@@ -143,8 +143,11 @@ class Playbook:
             elif tooling.resolve("gobuster"):
                 self.add("web", "vhost brute",
                          f"gobuster vhost -u {ip_base} --domain {reg} -w {vwl} -k")
-        if tooling.resolve("arjun"):
-            self.add("web", "parameter discovery", f"arjun -u {base}/")
+        if tooling.resolve("paramvoid"):
+            pwl = tooling.find_wordlist("params")
+            wflag = f" -w {pwl}" if pwl else ""
+            self.add("web", "parameter discovery (paramvoid)",
+                     f"paramvoid -u {base}/{wflag} -oT paramvoid.txt")
 
     def _smb(self, port):
         ip = self.ip
