@@ -6,11 +6,20 @@ virtual host that the server's default block hides (e.g. `git.nexus.htb`,
 wordlist and reports only names whose response differs from the target's
 default response — the same size/hash filtering you'd do by hand with ffuf's
 `-fs`, done automatically.
+
+The hard part is the *catch-all*: many servers answer HTTP 200 (or an
+identical page) for **every** unknown Host header. A naive size/status filter
+then flags the whole wordlist. To avoid that this module builds its baseline
+from several random probes, compares each candidate against the baseline by
+content similarity (not just status+length), and — as a backstop — bails out
+entirely when more than a sane number of "distinct" hosts appear, since that
+only happens when the baseline itself is a blanket catch-all.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import difflib
 import re
 import socket
 import ssl
@@ -23,13 +32,47 @@ from ...data import knowledge
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
+# If more than this many *distinct* vhosts survive filtering, the target is
+# almost certainly a catch-all whose baseline we failed to model — real boxes
+# rarely expose this many name-based vhosts. Discard and warn instead of
+# flooding /etc/hosts and the enrichment phase with garbage.
+_MAX_VHOSTS = 25
+# Bodies are normalised + capped before similarity comparison (keeps difflib
+# fast across a 12k wordlist and ignores volatile per-request tokens).
+_BODY_CAP = 3000
+_SIMILAR = 0.90
+
+
+class _Resp:
+    __slots__ = ("status", "length", "title", "norm")
+
+    def __init__(self, status: int, length: int, title: str, norm: str):
+        self.status = status
+        self.length = length
+        self.title = title
+        self.norm = norm
+
+
+_VOLATILE_RE = re.compile(r"[0-9a-f]{8,}|\d+", re.IGNORECASE)
+
+
+def _normalize(body: str, host_header: str) -> str:
+    """Strip the echoed Host header and volatile tokens (ids, dates, csrf,
+    lengths) so two renderings of the same default page compare as equal."""
+    b = body[:_BODY_CAP].lower()
+    if host_header:
+        b = b.replace(host_header.lower(), "")
+    b = _VOLATILE_RE.sub("", b)
+    return re.sub(r"\s+", " ", b).strip()
+
 
 def _request(ip: str, port: int, secure: bool, host_header: str,
-             timeout: float = 6.0) -> Optional[Tuple[int, int, str]]:
-    """Raw HTTP/1.0 GET with an arbitrary Host header.
+             timeout: float = 6.0) -> Optional[_Resp]:
+    """Raw HTTP/1.1 GET with an arbitrary Host header.
 
-    Returns (status, body_length, title) or None. We speak HTTP directly so we
-    fully control the Host header and avoid any client-side normalization.
+    Returns a _Resp (status, body length, title, normalised body) or None. We
+    speak HTTP directly so we fully control the Host header and avoid any
+    client-side normalization.
     """
     req = (f"GET / HTTP/1.1\r\nHost: {host_header}\r\n"
            f"User-Agent: scryer\r\nAccept: */*\r\nConnection: close\r\n\r\n")
@@ -73,15 +116,7 @@ def _request(ip: str, port: int, secure: bool, host_header: str,
     tm = _TITLE_RE.search(body)
     if tm:
         title = re.sub(r"\s+", " ", tm.group(1)).strip()[:80]
-    return status, len(body), title
-
-
-def _signature(resp: Optional[Tuple[int, int, str]]) -> Optional[Tuple[int, int, str]]:
-    if resp is None:
-        return None
-    status, length, title = resp
-    # Bucket body length so trivial dynamic differences don't defeat the filter.
-    return status, length // 64, title
+    return _Resp(status, len(body), title, _normalize(body, host_header))
 
 
 def _candidate_domains(host: HostReport, explicit: Optional[str]) -> List[str]:
@@ -140,65 +175,118 @@ def _load_words(cap: int = 12000) -> List[str]:
     return merged
 
 
+def _build_baseline(ip: str, port: int, secure: bool, base: str) -> List[_Resp]:
+    """Probe several guaranteed-nonexistent hosts to model the server's
+    default/catch-all response. Returns the distinct baseline responses (there
+    can be more than one — some servers alternate)."""
+    probes = []
+    for _ in range(4):
+        r = _request(ip, port, secure, f"nonexistent-{_rand()}.{base}")
+        if r is not None:
+            probes.append(r)
+    return probes
+
+
+def _matches_baseline(resp: _Resp, baseline: List[_Resp]) -> bool:
+    """True if resp looks like the server's default/catch-all answer."""
+    for b in baseline:
+        if resp.status != b.status:
+            continue
+        # Same status. If either body is empty/near-empty, status match is
+        # enough (a bare 200/403/404 with no content is the default block).
+        if not resp.norm and not b.norm:
+            return True
+        if not resp.norm or not b.norm:
+            # One empty, one not: only a match if both are tiny.
+            if resp.length < 64 and b.length < 64:
+                return True
+            continue
+        sm = difflib.SequenceMatcher(None, resp.norm, b.norm)
+        # quick_ratio is a cheap upper bound; only pay for the real ratio when
+        # it's plausibly a match.
+        if sm.quick_ratio() >= _SIMILAR and sm.ratio() >= _SIMILAR:
+            return True
+    return False
+
+
 def _brute_domain(host: HostReport, ip: str, port: int, secure: bool,
                   base: str, words: List[str], workers: int) -> None:
     utils.section(f"VHOST fuzz {base} on {ip}:{port}")
 
-    # Baseline: how the server answers a Host it does not know. Use two random
-    # names; if they differ from each other the target is too noisy to filter.
-    b1 = _signature(_request(ip, port, secure, f"nonexistent-{_rand()}.{base}"))
-    b2 = _signature(_request(ip, port, secure, f"nonexistent-{_rand()}.{base}"))
-    baseline = b1
-    if b1 and b2 and b1 != b2:
-        utils.log("warn", "unstable default response — vhost filtering is "
-                          "best-effort", indent=1)
-        baseline = None
-    elif b1:
-        # Detect the classic Nginx/Apache default-server catch-all.
-        utils.log("dim", f"default vhost baseline: HTTP {b1[0]}, ~{b1[1]*64}B", indent=1)
-        host.add(Finding(
-            title=f"Default virtual-host catch-all on :{port}",
-            detail="Unknown Host headers fall back to a default server block. "
-                   "Real vhosts must be found by name, not by port — brute the "
-                   "Host header (this scan does).",
-            severity="info", category="web", port=port, service="http",
-        ))
-
-    found: List[str] = []
+    baseline = _build_baseline(ip, port, secure, base)
+    if not baseline:
+        utils.log("warn", "no baseline response — server not answering the "
+                          "bare IP; vhost filtering disabled", indent=1)
+    else:
+        statuses = sorted({b.status for b in baseline})
+        lens = sorted({b.length for b in baseline})
+        utils.log("dim",
+                  f"default vhost baseline: HTTP {statuses}, "
+                  f"{lens[0]}-{lens[-1]}B", indent=1)
+        if any(b.status == 200 for b in baseline):
+            host.add(Finding(
+                title=f"Default virtual-host catch-all on :{port}",
+                detail="Unknown Host headers fall back to a default server "
+                       "block that answers 200. Real vhosts are matched by "
+                       "content difference from this default, not by status.",
+                severity="info", category="web", port=port, service="http",
+            ))
 
     def probe(word: str):
         fqdn = f"{word}.{base}"
-        sig = _signature(_request(ip, port, secure, fqdn))
-        if sig is None:
+        resp = _request(ip, port, secure, fqdn)
+        if resp is None:
             return None
-        if baseline is not None and sig == baseline:
+        if resp.status in (400, 0):
             return None
-        if sig[0] in (400, 0):
+        if baseline and _matches_baseline(resp, baseline):
             return None
-        return fqdn, sig
+        return fqdn, resp
 
+    candidates: List[Tuple[str, _Resp]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         for result in pool.map(probe, words):
-            if not result:
-                continue
-            fqdn, sig = result
-            found.append(fqdn)
-            status, lbucket, title = sig
-            new = host.add_hostname(fqdn)
-            extra = f' "{title}"' if title else ""
-            utils.log("hot" if new else "good",
-                      f"vhost {fqdn}  ->  HTTP {status}, ~{lbucket*64}B{extra}",
-                      indent=1)
-            host.add(Finding(
-                title=f"Virtual host discovered: {fqdn}",
-                detail=f"HTTP {status}, distinct from default response"
-                       + (f', title: {title}' if title else ""),
-                severity="medium", category="web", port=port, service="http",
-                evidence=fqdn,
-            ))
+            if result:
+                candidates.append(result)
 
-    if not found:
+    # Backstop: a flood of "distinct" hosts means the baseline didn't capture
+    # the server's catch-all behaviour. Report nothing rather than poison
+    # /etc/hosts and the enrichment phase with the entire wordlist.
+    if len(candidates) > _MAX_VHOSTS:
+        utils.log("warn",
+                  f"{len(candidates)} Host headers answered differently from "
+                  f"baseline — this is a catch-all, not {len(candidates)} real "
+                  f"vhosts. Suppressing (filter unreliable on this target).",
+                  indent=1)
+        host.add(Finding(
+            title=f"Virtual-host brute inconclusive on :{port} (catch-all)",
+            detail=f"{len(candidates)} names differed from the default "
+                   "response, which indicates a wildcard/catch-all vhost "
+                   "rather than that many real hosts. Re-run with an explicit "
+                   "-D <domain> and a curated list, or verify names manually "
+                   "(ffuf -fs) before trusting them.",
+            severity="info", category="web", port=port, service="http",
+            confidence="potential",
+        ))
+        return
+
+    if not candidates:
         utils.log("dim", "no distinct virtual hosts found", indent=1)
+        return
+
+    for fqdn, resp in candidates:
+        new = host.add_hostname(fqdn)
+        extra = f' "{resp.title}"' if resp.title else ""
+        utils.log("hot" if new else "good",
+                  f"vhost {fqdn}  ->  HTTP {resp.status}, ~{resp.length}B{extra}",
+                  indent=1)
+        host.add(Finding(
+            title=f"Virtual host discovered: {fqdn}",
+            detail=f"HTTP {resp.status}, distinct from default response"
+                   + (f', title: {resp.title}' if resp.title else ""),
+            severity="medium", category="web", port=port, service="http",
+            evidence=fqdn,
+        ))
 
 
 def _rand() -> str:
