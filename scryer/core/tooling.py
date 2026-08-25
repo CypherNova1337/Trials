@@ -1,0 +1,241 @@
+"""External-tool registry and orchestration.
+
+scryer is a *full orchestrator*: for every job it prefers the best real tool
+on the box (nmap, ffuf, feroxbuster, enum4linux-ng, snmpwalk, …) and falls
+back to a pure-python implementation only when that tool is absent — so it is
+fast and deep on Kali but never dead on a bare shell.
+
+`scryer --toolcheck` audits what is installed; `--toolcheck --install` installs
+whatever is missing via the detected package manager. Nothing here is executed
+unless the user asks for it.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+from . import utils
+
+
+@dataclass
+class ExtTool:
+    name: str                       # primary binary expected on PATH
+    purpose: str
+    apt: Optional[str] = None       # apt package that provides it
+    pipx: Optional[str] = None      # pipx / pip package
+    go: Optional[str] = None        # `go install` path
+    alts: List[str] = field(default_factory=list)  # equivalents that also count
+    essential: bool = False         # part of the recommended minimum kit
+
+    def resolve(self) -> Optional[str]:
+        for cand in (self.name, *self.alts):
+            path = shutil.which(cand)
+            if path:
+                return path
+        return None
+
+    def available(self) -> bool:
+        return self.resolve() is not None
+
+
+# The kit. Ordered by category. `alts` lets one row cover interchangeable tools.
+REGISTRY: List[ExtTool] = [
+    # --- discovery / scanning ---
+    ExtTool("nmap", "service/version/script scanning", apt="nmap", essential=True),
+    ExtTool("rustscan", "very fast full-range TCP port sweep",
+            apt="rustscan", alts=["masscan"]),
+    ExtTool("masscan", "mass TCP port sweep", apt="masscan"),
+    # --- web ---
+    ExtTool("feroxbuster", "recursive content discovery",
+            apt="feroxbuster", alts=["ffuf", "gobuster"], essential=True),
+    ExtTool("ffuf", "web/vhost/param fuzzing", apt="ffuf", essential=True),
+    ExtTool("gobuster", "dir/dns/vhost brute", apt="gobuster"),
+    ExtTool("whatweb", "web tech fingerprinting", apt="whatweb", essential=True),
+    ExtTool("nikto", "web server vuln scanning", apt="nikto"),
+    ExtTool("wpscan", "WordPress scanning", apt="wpscan"),
+    ExtTool("arjun", "HTTP parameter discovery", pipx="arjun"),
+    ExtTool("katana", "fast web crawler", go="github.com/projectdiscovery/katana/cmd/katana@latest"),
+    # --- SMB / AD / Windows ---
+    ExtTool("enum4linux-ng", "SMB/LDAP AD enumeration",
+            apt="enum4linux-ng", alts=["enum4linux"], essential=True),
+    ExtTool("netexec", "SMB/LDAP/WinRM swiss-army",
+            pipx="netexec", alts=["nxc", "crackmapexec", "cme"], essential=True),
+    ExtTool("smbclient", "SMB share access", apt="smbclient", essential=True),
+    ExtTool("rpcclient", "MSRPC enumeration", apt="samba-common-bin"),
+    ExtTool("nbtscan", "NetBIOS name scanning", apt="nbtscan"),
+    ExtTool("kerbrute", "Kerberos user enum / spray",
+            go="github.com/ropnop/kerbrute@latest"),
+    ExtTool("GetNPUsers.py", "AS-REP roasting",
+            pipx="impacket", alts=["impacket-GetNPUsers", "GetNPUsers"]),
+    ExtTool("ldapsearch", "LDAP queries", apt="ldap-utils", essential=True),
+    ExtTool("evil-winrm", "WinRM shell", apt="evil-winrm"),
+    # --- other services ---
+    ExtTool("snmpwalk", "SNMP enumeration", apt="snmp", essential=True),
+    ExtTool("onesixtyone", "SNMP community brute", apt="onesixtyone"),
+    ExtTool("showmount", "NFS export listing", apt="nfs-common"),
+    ExtTool("rsync", "rsync module listing", apt="rsync"),
+    ExtTool("hydra", "credential brute forcing", apt="hydra"),
+    ExtTool("redis-cli", "Redis client", apt="redis-tools"),
+    ExtTool("mysql", "MySQL client", apt="default-mysql-client", alts=["mariadb"]),
+    ExtTool("psql", "PostgreSQL client", apt="postgresql-client"),
+    ExtTool("dig", "DNS queries", apt="dnsutils", alts=["host", "nslookup"]),
+    # --- exploit intel / wordlists ---
+    ExtTool("searchsploit", "offline Exploit-DB search",
+            apt="exploitdb", essential=True),
+    ExtTool("seclists", "wordlist collection (SecLists)", apt="seclists",
+            alts=["/usr/share/seclists"], essential=True),
+]
+
+
+def resolve(name: str) -> Optional[str]:
+    """Return the path to a tool (respecting alternatives), or None."""
+    for t in REGISTRY:
+        if t.name == name or name in t.alts:
+            return t.resolve()
+    return shutil.which(name)
+
+
+def find_wordlist(kind: str) -> Optional[str]:
+    """Locate a sensible SecLists wordlist for *kind* if SecLists is present.
+
+    kind: 'dir' | 'vhost' | 'dns' | 'passwords' | 'users'
+    """
+    roots = ["/usr/share/seclists", "/usr/share/wordlists/seclists",
+             os.path.expanduser("~/SecLists")]
+    candidates = {
+        "dir": ["Discovery/Web-Content/raft-medium-directories.txt",
+                "Discovery/Web-Content/directory-list-2.3-medium.txt",
+                "Discovery/Web-Content/common.txt"],
+        "vhost": ["Discovery/DNS/subdomains-top1million-5000.txt",
+                  "Discovery/DNS/subdomains-top1million-20000.txt",
+                  "Discovery/DNS/namelist.txt"],
+        "dns": ["Discovery/DNS/subdomains-top1million-5000.txt",
+                "Discovery/DNS/namelist.txt"],
+        "passwords": ["Passwords/Common-Credentials/10-million-password-list-top-1000.txt",
+                      "Passwords/Common-Credentials/best110.txt",
+                      "rockyou.txt"],
+        "users": ["Usernames/top-usernames-shortlist.txt",
+                  "Usernames/Names/names.txt"],
+    }.get(kind, [])
+    # A common non-SecLists fallback for dir brute:
+    if kind == "dir":
+        candidates.append("../dirb/common.txt")
+    for root in roots:
+        for rel in candidates:
+            path = os.path.normpath(os.path.join(root, rel))
+            if os.path.isfile(path):
+                return path
+    # dirb ships with Kali independently of SecLists.
+    for p in ("/usr/share/wordlists/dirb/common.txt",
+              "/usr/share/wordlists/rockyou.txt"):
+        if os.path.isfile(p) and kind in ("dir", "passwords"):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# System check + install
+# ---------------------------------------------------------------------------
+def _pkg_manager() -> Optional[str]:
+    for mgr in ("apt-get", "apt", "dnf", "yum", "pacman", "brew"):
+        if shutil.which(mgr):
+            return mgr
+    return None
+
+
+def system_check() -> None:
+    """Print an inventory of external tools grouped by present/missing."""
+    print(utils.banner())
+    present, missing = [], []
+    for t in REGISTRY:
+        (present if t.available() else missing).append(t)
+
+    utils.section("Tool inventory")
+    print(f"  {utils.c(str(len(present)) + ' present', utils.C.GREEN)}, "
+          f"{utils.c(str(len(missing)) + ' missing', utils.C.YELLOW)} "
+          f"of {len(REGISTRY)} known tools\n")
+
+    for t in REGISTRY:
+        ok = t.available()
+        mark = utils.c("  ok ", utils.C.GREEN) if ok else utils.c("MISS", utils.C.YELLOW)
+        star = utils.c("*", utils.C.CYAN, utils.C.BOLD) if t.essential else " "
+        loc = t.resolve() if ok else (f"apt:{t.apt}" if t.apt else
+                                      f"pipx:{t.pipx}" if t.pipx else
+                                      f"go:{t.go}" if t.go else "manual")
+        print(f"  [{mark}]{star} {t.name:<16} {utils.c(t.purpose, utils.C.GREY)}")
+        if not ok:
+            print(f"          {utils.c('install: ' + str(loc), utils.C.GREY)}")
+
+    ess_missing = [t for t in missing if t.essential]
+    if missing:
+        print(f"\n  {utils.c('*', utils.C.CYAN)} = recommended minimum kit "
+              f"({len(ess_missing)} of those missing)")
+        print(f"  Run {utils.c('scryer --toolcheck --install', utils.C.BOLD)} "
+              f"to install the missing tools.")
+    else:
+        utils.log("good", "full kit present — you are ready.")
+
+
+def install_missing(assume_yes: bool = False) -> None:
+    """Install missing tools via the detected package manager / pipx / go."""
+    missing = [t for t in REGISTRY if not t.available()]
+    if not missing:
+        utils.log("good", "nothing to install — full kit present.")
+        return
+
+    mgr = _pkg_manager()
+    apt_pkgs = sorted({t.apt for t in missing if t.apt})
+    pipx_pkgs = sorted({t.pipx for t in missing if t.pipx and not t.apt})
+    go_pkgs = sorted({t.go for t in missing if t.go and not t.apt and not t.pipx})
+
+    sudo = [] if os.geteuid() == 0 else (["sudo"] if shutil.which("sudo") else [])
+    plan = []
+    if apt_pkgs and mgr:
+        if mgr in ("apt-get", "apt"):
+            plan.append(sudo + [mgr, "install", "-y", *apt_pkgs])
+        elif mgr in ("dnf", "yum"):
+            plan.append(sudo + [mgr, "install", "-y", *apt_pkgs])
+        elif mgr == "pacman":
+            plan.append(sudo + [mgr, "-S", "--noconfirm", *apt_pkgs])
+        elif mgr == "brew":
+            plan.append([mgr, "install", *apt_pkgs])
+    if pipx_pkgs:
+        installer = "pipx" if shutil.which("pipx") else "pip"
+        for p in pipx_pkgs:
+            plan.append([installer, "install", p])
+    if go_pkgs and shutil.which("go"):
+        for p in go_pkgs:
+            plan.append(["go", "install", p])
+
+    if not plan:
+        utils.log("warn", "no supported package manager found to install with.")
+        return
+
+    utils.section("Install plan")
+    for cmd in plan:
+        print("  " + utils.c(" ".join(cmd), utils.C.CYAN))
+    unhandled = [t.name for t in missing
+                 if not t.apt and not t.pipx and not t.go]
+    if unhandled:
+        utils.log("warn", f"install manually: {', '.join(unhandled)}")
+
+    if not assume_yes:
+        try:
+            ans = input(f"\n  {utils.c('Proceed with install? [y/N] ', utils.C.BOLD)}")
+        except EOFError:
+            ans = "n"
+        if ans.strip().lower() not in ("y", "yes"):
+            utils.log("info", "aborted — nothing installed.")
+            return
+
+    for cmd in plan:
+        utils.log("info", f"running: {' '.join(cmd)}")
+        rc, out, err = utils.run(cmd, timeout=1800)
+        if rc == 0:
+            utils.log("good", f"ok: {cmd[0]} {cmd[1] if len(cmd) > 1 else ''}")
+        else:
+            utils.log("bad", f"failed ({rc}): {(err or out).strip()[:200]}")
+    utils.log("info", "re-run `scryer --toolcheck` to confirm.")

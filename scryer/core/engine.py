@@ -13,9 +13,10 @@ from typing import List
 from . import utils
 from .report import HostReport, Finding
 from ..data import knowledge
-from ..modules import discovery, ports, fingerprint
+from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
-    http, tls, dns, smb, auth_svcs, datastores, ldap, vhost)
+    http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
+    snmp, mail, netshares, sqldb, remote, webcrawl)
 
 
 class Engine:
@@ -35,13 +36,18 @@ class Engine:
 
         discovery.liveness(host, ip)
 
-        port_list = self._port_selection()
-        open_ports = ports.connect_scan(
-            host, ip, port_list,
-            timeout=self.opts.timeout, workers=self.opts.workers)
-
-        if self.opts.nmap and open_ports:
-            ports.nmap_service_scan(host, ip, open_ports, timeout=self.opts.nmap_timeout)
+        # Port discovery: prefer the nmap/rustscan pipeline (fast + NSE intel);
+        # fall back to the pure-python scanner when nmap is unavailable or the
+        # user forced --no-nmap.
+        open_ports = None
+        used_nmap = False
+        if not getattr(self.opts, "no_nmap", False):
+            open_ports = nmapscan.orchestrate(host, ip, self.opts)
+            used_nmap = open_ports is not None
+        if open_ports is None:
+            open_ports = ports.connect_scan(
+                host, ip, self._port_selection(),
+                timeout=self.opts.timeout, workers=self.opts.workers)
 
         if not open_ports:
             utils.log("warn", "no open ports — nothing to enrich")
@@ -49,7 +55,9 @@ class Engine:
             return host
 
         # Confirm what each port actually speaks before dispatching modules.
-        fingerprint.refine(host, timeout=max(self.opts.timeout, 4.0))
+        # nmap -sV is authoritative, so only fingerprint when it didn't run.
+        if not used_nmap:
+            fingerprint.refine(host, timeout=max(self.opts.timeout, 4.0))
 
         # First deep pass over discovered services.
         before = set(host.hostnames)
@@ -69,6 +77,11 @@ class Engine:
 
         self._ad_methodology()
         self._os_inference()
+
+        # Turn identified versions into concrete Exploit-DB leads.
+        if not getattr(self.opts, "no_searchsploit", False):
+            exploitintel.run(host)
+
         host.finished = utils.now_iso()
         return host
 
@@ -147,6 +160,10 @@ class Engine:
                 if secure:
                     tls.enrich(host, port)
                 http.enrich(host, port, secure=secure)
+                webcrawl.whatweb(host, port, secure)
+                webcrawl.crawl(host, port, secure)
+                if getattr(self.opts, "web_brute", False):
+                    webcrawl.dir_brute(host, port, secure)
                 return True
 
             if secure or port in (443, 8443) or "ssl" in svc:
@@ -178,6 +195,36 @@ class Engine:
                 return True
             if port in (27017, 27018) or svc == "mongodb":
                 datastores.mongodb(host, port)
+                return True
+            if port in (25, 465, 587) or svc in ("smtp", "smtps", "submission"):
+                mail.enrich(host, port)
+                return True
+            if port == 161 or "snmp" in svc:
+                snmp.enrich(host, port)
+                return True
+            if port == 2049 or svc == "nfs":
+                netshares.nfs(host, port)
+                return True
+            if port == 873 or svc == "rsync":
+                netshares.rsync(host, port)
+                return True
+            if port == 3306 or svc == "mysql":
+                sqldb.mysql(host, port)
+                return True
+            if port == 5432 or svc in ("postgresql", "postgres"):
+                sqldb.postgresql(host, port)
+                return True
+            if port == 1433 or "ms-sql" in svc or svc == "mssql":
+                sqldb.mssql(host, port)
+                return True
+            if port == 3389 or svc in ("rdp", "ms-wbt-server"):
+                remote.rdp(host, port)
+                return True
+            if port in (5900, 5901, 5902) or svc == "vnc":
+                remote.vnc(host, port)
+                return True
+            if port in (5985, 5986) or "winrm" in svc or "wsman" in svc:
+                remote.winrm(host, port)
                 return True
         except Exception as exc:  # keep one bad module from killing the scan
             utils.log("bad", f"module error on port {port}: {exc}")
