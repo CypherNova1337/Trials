@@ -8,6 +8,35 @@ import socket
 
 from ...core import utils
 from ...core.report import HostReport, Finding
+from ...data import knowledge
+
+
+def _grab_ftp_flag(host: HostReport, conn, port: int, name: str) -> None:
+    """Download a flag/proof file over FTP and print its contents."""
+    chunks = []
+    try:
+        conn.retrbinary(f"RETR {name}", chunks.append, blocksize=4096)
+    except Exception:
+        utils.log("hot", f"flag file present (couldn't read): {name}", indent=3)
+        return
+    content = b"".join(chunks).decode("latin-1", "replace").strip()
+    if not content:
+        return
+    tokens = list(knowledge.find_flags(content))
+    display = content if len(content) <= 400 else content[:400] + " …"
+    bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
+    print("\n  " + bar)
+    print("  " + utils.c("║ FLAG FILE FOUND (FTP)", utils.C.GREEN, utils.C.BOLD)
+          + utils.c(f"  {name}", utils.C.GREY))
+    for line in display.splitlines() or [display]:
+        print("  " + utils.c("║ ", utils.C.GREEN, utils.C.BOLD)
+              + utils.c(line, utils.C.YELLOW, utils.C.BOLD))
+    print("  " + utils.c("╚" + "═" * 56, utils.C.GREEN, utils.C.BOLD) + "\n")
+    host.add(Finding(
+        title=f"FLAG captured over FTP: {name}",
+        detail=(", ".join(tokens) if tokens else display),
+        severity="critical", category="flag", port=port, service="ftp",
+        evidence=f"ftp://{name}\n{content[:800]}"))
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +76,10 @@ def ftp(host: HostReport, port: int) -> None:
                 ))
                 for line in listing:
                     name = line.split()[-1] if line.split() else ""
-                    if name.lower() in ("user.txt", "flag.txt") or name.endswith(
+                    low = name.lower()
+                    if low in knowledge.FLAG_FILES:
+                        _grab_ftp_flag(host, conn, port, name)
+                    elif low in ("user.txt", "flag.txt") or name.endswith(
                             (".txt", ".sql", ".bak", ".zip", ".conf")):
                         utils.log("hot", f"interesting file: {name}", indent=3)
         except Exception:

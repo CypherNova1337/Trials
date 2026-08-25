@@ -112,8 +112,28 @@ def enrich(host: HostReport, port: int, secure: bool,
     _security_headers(host, port, headers, secure)
     _redirect_hostnames(host, headers)
     _comments_and_emails(host, port, body, pfx)
+    scan_body_for_flags(host, port, base + "/", body, pfx)
     _forms(host, port, body)
     _content_discovery(host, port, base, vhost)
+
+
+def scan_body_for_flags(host: HostReport, port: int, source: str, body: str,
+                        pfx: str = "") -> None:
+    """Spot flag-format tokens (HTB{…}, flag{…}, 32-hex) sitting in a response
+    body / comment and surface them immediately."""
+    for tok in knowledge.find_flags(body or ""):
+        # Skip bare 32-hex that is almost certainly an asset hash, not a flag.
+        looks_hashy = len(tok) == 32 and "/" not in source and (
+            "css" in source or "js" in source or "static" in source)
+        if looks_hashy:
+            continue
+        print("  " + utils.c(f"⚑ possible flag on {source}: ", utils.C.GREEN, utils.C.BOLD)
+              + utils.c(tok, utils.C.YELLOW, utils.C.BOLD))
+        host.add(Finding(
+            title=f"{pfx}Possible flag in page content",
+            detail=tok,
+            severity="critical", category="flag", port=port, service="http",
+            evidence=f"{source}: {tok}"))
 
 
 def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],
@@ -375,12 +395,41 @@ def _content_discovery(host: HostReport, port: int, base: str,
                 severity="high", category="leak", port=port, service="http",
                 evidence=url))
 
+        # Flag / proof file — grab it and print the contents outright.
+        fname = path.rsplit("/", 1)[-1].lower()
+        if status == 200 and body and body.strip() and fname in knowledge.FLAG_FILES:
+            dump_flag_file(host, port, url, body, pfx)
+
         # Pull credentials out of leaked config files.
         if status == 200 and body and path in knowledge.SECRET_FILES:
             _harvest_secrets(host, port, path, body, pfx)
 
     if not hits:
         utils.log("dim", "no notable paths", indent=2)
+
+
+def dump_flag_file(host: HostReport, port: int, url: str, body: str,
+                   pfx: str = "") -> None:
+    """Print the contents of a discovered flag/proof file and record it."""
+    content = body.strip()
+    # Prefer an actual flag token if the file wraps it in markup/whitespace.
+    tokens = list(knowledge.find_flags(content))
+    display = content if len(content) <= 400 else content[:400] + " …"
+
+    bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
+    print("\n  " + bar)
+    print("  " + utils.c("║ FLAG FILE FOUND", utils.C.GREEN, utils.C.BOLD)
+          + utils.c(f"  {url}", utils.C.GREY))
+    for line in display.splitlines() or [display]:
+        print("  " + utils.c("║ ", utils.C.GREEN, utils.C.BOLD)
+              + utils.c(line, utils.C.YELLOW, utils.C.BOLD))
+    print("  " + utils.c("╚" + "═" * 56, utils.C.GREEN, utils.C.BOLD) + "\n")
+
+    host.add(Finding(
+        title=f"{pfx}FLAG captured: {url.rsplit('/', 1)[-1]}",
+        detail=(", ".join(tokens) if tokens else display),
+        severity="critical", category="flag", port=port, service="http",
+        evidence=f"{url}\n{content[:800]}"))
 
 
 def _harvest_secrets(host: HostReport, port: int, path: str, body: str,

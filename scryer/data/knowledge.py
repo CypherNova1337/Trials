@@ -107,8 +107,35 @@ COMMON_WEB_PATHS = [
     "actuator/env", "manager/html", "console/", "cgi-bin/", "uploads/",
     "test.php", "info.php", "phpinfo.php", "readme.html", "CHANGELOG.md",
     "composer.json", "package.json", "id_rsa", ".ssh/id_rsa",
-    ".well-known/security.txt", "user.txt", "flag.txt",
+    ".well-known/security.txt",
+    # flag / proof files — grabbed and printed automatically when found
+    "flag", "flag.txt", "flags.txt", "user.txt", "root.txt", "proof.txt",
+    "user.flag", "root.flag", "flag.php", "flag.html",
 ]
+
+# Filenames that hold a flag/proof — when one of these returns content, scryer
+# prints the contents outright instead of just noting the path.
+FLAG_FILES = {
+    "flag", "flag.txt", "flags.txt", "user.txt", "root.txt", "proof.txt",
+    "user.flag", "root.flag", "flag.php", "flag.html", "flag.json",
+}
+
+# Recognisable flag formats: HTB{...}/flag{...}/CTF{...} and the bare 32-hex
+# HTB-style hash. Used to spot flags inside any response body too.
+FLAG_RE = re.compile(
+    r"(?:[A-Za-z0-9_]{2,20}\{[^}\r\n]{2,120}\}|\b[0-9a-fA-F]{32}\b)")
+
+
+def find_flags(text: str):
+    """Yield distinct flag-format tokens found in *text*."""
+    if not text:
+        return
+    seen = set()
+    for m in FLAG_RE.finditer(text):
+        tok = m.group(0)
+        if tok not in seen:
+            seen.add(tok)
+            yield tok
 
 # Files worth downloading and parsing for secrets when they return content.
 SECRET_FILES = {

@@ -106,6 +106,20 @@ def summarize_console(host: HostReport) -> None:
     print(c(f"  RECON SUMMARY  ::  {host.target}", C.CYAN, C.BOLD))
     print(c("═" * 64, C.BLUE, C.BOLD))
 
+    # Flags first — the whole point of a CTF run.
+    flags = [f for f in host.findings if f.category == "flag"]
+    if flags:
+        print("  " + c("⚑ FLAGS", C.GREEN, C.BOLD))
+        seen = set()
+        for f in flags:
+            val = f.detail or f.title
+            if val in seen:
+                continue
+            seen.add(val)
+            print("  " + c(f"  {val}", C.YELLOW, C.BOLD)
+                  + c(f"   ({f.service or ''}:{f.port or ''})", C.GREY))
+        print()
+
     if host.resolved_ip:
         print(f"  {c('IP', C.GREY)}        {host.resolved_ip}")
     if host.hostnames:
