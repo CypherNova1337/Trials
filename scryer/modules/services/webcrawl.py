@@ -17,7 +17,7 @@ from typing import Optional, Set
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
-from ...data import knowledge
+from ...data import knowledge, filetypes
 
 
 _UA = "Mozilla/5.0 (compatible; scryer/2.0)"
@@ -120,6 +120,21 @@ def crawl(host: HostReport, port: int, secure: bool,
         for m in _ENDPOINT_RE.findall(body or ""):
             endpoints.add(m)
 
+    # Classify any interesting file types linked from the page / JS (a link to
+    # backup.zip, id_rsa, db.sqlite, capture.pcap, …).
+    pfx = f"[{vhost}] " if vhost else ""
+    seen_ft = set()
+    for href in set(parser.links) | endpoints:
+        info = filetypes.classify(href)
+        if info and info[1] in ("critical", "high") and href not in seen_ft:
+            seen_ft.add(href)
+            cat, sev, note, _tag = info
+            utils.log("hot", f"linked {cat} file: {href}", indent=2)
+            host.add(Finding(
+                title=f"{pfx}Linked {cat} file: {href}",
+                detail=note, severity=sev, category="leak", port=port,
+                service="http", evidence=href))
+
     # Report the interesting endpoints (api/admin/internal/etc.).
     interesting = sorted(e for e in endpoints if _is_interesting(e))
     if interesting:
@@ -187,16 +202,25 @@ def dir_brute(host: HostReport, port: int, secure: bool,
         utils.log("dim", "no wordlist found for dir brute (install seclists)", indent=1)
         return
 
+    # Fuzz file extensions relevant to the detected server tech (php/asp/…).
+    # Keep only simple alnum extensions the fuzzers handle cleanly; scryer's own
+    # backup-probing covers the .bak/~/tar.gz style variants of found files.
+    raw_exts = filetypes.ext_candidates_for(filetypes.tech_from_text(_tech_blob(host)))
+    exts = [e for e in raw_exts if e.isalnum()]
+    ferox_x = ",".join(exts)
+    ffuf_e = ",".join("." + e for e in exts)
+
     ferox = tooling.resolve("feroxbuster")
     ffuf = tooling.resolve("ffuf")
     if ferox:
         cmd = [ferox, "-u", target, "-w", wl, "-k", "-t", "50",
-               "--silent", "-d", "2"]
+               "--silent", "-d", "2", "-x", ferox_x]
     elif ffuf:
-        cmd = [ffuf, "-u", f"{target}/FUZZ", "-w", wl, "-ac", "-s"]
+        cmd = [ffuf, "-u", f"{target}/FUZZ", "-w", wl, "-ac", "-s", "-e", ffuf_e]
     else:
         utils.log("dim", "feroxbuster/ffuf not installed for dir brute", indent=1)
         return
+    utils.log("info", f"dir brute extensions: {ferox_x}", indent=1)
 
     utils.log("info", f"dir brute: {' '.join(cmd)}", indent=1)
     rc, out, _ = utils.run(cmd, timeout=600)
@@ -212,6 +236,19 @@ def dir_brute(host: HostReport, port: int, secure: bool,
 
 
 # --- helpers ---------------------------------------------------------------
+def _tech_blob(host: HostReport) -> str:
+    """Gather server/tech text from findings so we can pick fuzz extensions."""
+    bits = []
+    for f in host.findings:
+        t = f.title.lower()
+        if any(k in t for k in ("server header", "x-powered-by", "generator",
+                                "identified", "whatweb", "page title")):
+            bits.append(f.title + " " + (f.evidence or ""))
+    for p in host.open_ports:
+        bits.append((p.get("service") or "") + " " + (p.get("version") or ""))
+    return " ".join(bits)
+
+
 def _absolute(base: str, ref: str) -> str:
     from urllib.parse import urljoin
     return urljoin(base + "/", ref)

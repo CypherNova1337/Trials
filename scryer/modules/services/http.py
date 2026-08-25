@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 
 from ...core import utils
 from ...core.report import HostReport, Finding
-from ...data import knowledge
+from ...data import knowledge, filetypes
 
 
 _UA = "Mozilla/5.0 (compatible; scryer/1.0)"
@@ -120,6 +120,25 @@ def _fetch(url: str, timeout: float = 8.0, method: str = "GET",
         return exc.code, headers, body.decode("utf-8", "replace")
     except Exception:
         return None, {}, ""
+
+
+def _fetch_bytes(url: str, n: int = 64, timeout: float = 6.0,
+                 vhost: Optional[str] = None) -> bytes:
+    """Fetch the first *n* raw bytes of a URL (for magic-byte sniffing)."""
+    hdrs = {"User-Agent": _UA}
+    if vhost:
+        hdrs["Host"] = vhost
+    req = urllib.request.Request(url, headers=hdrs)
+    try:
+        with _get_opener().open(req, timeout=timeout) as resp:
+            return resp.read(n)
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.read(n)
+        except Exception:
+            return b""
+    except Exception:
+        return b""
 
 
 def enrich(host: HostReport, port: int, secure: bool,
@@ -410,6 +429,7 @@ def _content_discovery(host: HostReport, port: int, base: str,
                          f"filtering soft-404s", indent=2)
 
     hits = 0
+    found_paths = []
     for path in knowledge.COMMON_WEB_PATHS:
         url = f"{base}/{path}"
         status, headers, body = _fetch(url, timeout=5.0, method="GET", vhost=vhost)
@@ -420,6 +440,8 @@ def _content_discovery(host: HostReport, port: int, base: str,
             continue  # server answers this for everything — not a real hit
 
         hits += 1
+        if status == 200:
+            found_paths.append(path)
         sev, cat = "info", "web"
         note = f"{status} /{path}"
         juicy = any(x in path for x in (
@@ -445,6 +467,10 @@ def _content_discovery(host: HostReport, port: int, base: str,
                 severity="high", category="leak", port=port, service="http",
                 evidence=url))
 
+        # Classify by file type (extension + magic bytes) and grade it.
+        if status == 200:
+            _classify_file(host, port, path, url, body, headers, vhost, pfx)
+
         # Flag / proof file — grab it and print the contents outright.
         fname = path.rsplit("/", 1)[-1].lower()
         if status == 200 and body and body.strip() and fname in knowledge.FLAG_FILES:
@@ -456,6 +482,94 @@ def _content_discovery(host: HostReport, port: int, base: str,
 
     if not hits:
         utils.log("dim", "no notable paths", indent=2)
+
+    # Chase backups of discovered source/pages (viewdoc.jsp -> viewdoc.jsp.bak).
+    _probe_backups(host, port, base, found_paths, cal, vhost, pfx)
+
+
+def _classify_file(host: HostReport, port: int, path: str, url: str,
+                   body: str, headers: Dict[str, str], vhost, pfx: str) -> None:
+    """Grade a discovered file by its type; confirm binary/high-value ones by
+    sniffing magic bytes (catches keys/DBs/captures served with odd names)."""
+    info = filetypes.classify(path)
+    ctype = (headers or {}).get("content-type", "")
+    # Sniff magic bytes when the type is high-value or the body looks binary.
+    label = None
+    high_value = info and info[1] in ("critical", "high")
+    binlike = "text" not in ctype and "html" not in ctype and "json" not in ctype
+    if high_value or binlike:
+        raw = _fetch_bytes(url, n=64, vhost=vhost)
+        label = filetypes.sniff(raw)
+
+    if label:
+        sev = filetypes.magic_severity(label) or "medium"
+        mark = "hot" if sev in ("critical", "high") else "good"
+        utils.log(mark, f"{label}: /{path}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}{label} exposed: /{path}",
+            detail=f"Confirmed by magic bytes at {url}. "
+                   + (info[2] if info else ""),
+            severity=sev, category="leak", port=port, service="http",
+            evidence=url))
+        return
+
+    if info:
+        cat, sev, note, tag = info
+        if sev == "info":
+            return
+        mark = "hot" if sev in ("critical", "high") else "good"
+        utils.log(mark, f"{cat} file (/{path})", indent=3)
+        host.add(Finding(
+            title=f"{pfx}{cat.title()} file exposed: /{path}",
+            detail=note, severity=sev, category="leak", port=port,
+            service="http", evidence=url))
+        # Text-bearing source/backup/config files often carry creds inline.
+        if cat in ("backup", "source", "config") and body and body.strip():
+            for lbl, val, s in _all_secrets(body):
+                utils.log("hot", f"{lbl} in /{path}: {val[:50]}", indent=4)
+                host.add(Finding(
+                    title=f"{pfx}{lbl} in /{path}", detail=f"{lbl} = {val}",
+                    severity=s, category="cred", port=port, service="http",
+                    evidence=f"{url}: {val}"))
+
+
+def _probe_backups(host: HostReport, port: int, base: str, found_paths: List[str],
+                   cal, vhost, pfx: str, cap: int = 40) -> None:
+    """For each discovered source/page, request common backup variants — the
+    classic 'source of the running page' leak."""
+    seeds = [p for p in found_paths
+             if filetypes.classify(p) and filetypes.classify(p)[0] == "source"]
+    # Also try backups of common index pages even if not individually found.
+    for guess in ("index.php", "index.html", "index.jsp", "index.aspx", "login.php"):
+        if guess not in seeds:
+            seeds.append(guess)
+    if not seeds:
+        return
+    utils.log("info", "probing for source/config backups", indent=1)
+    tried = 0
+    for seed in seeds:
+        for cand in filetypes.backup_candidates(seed):
+            if tried >= cap:
+                return
+            tried += 1
+            url = f"{base}/{cand}"
+            status, headers, body = _fetch(url, timeout=5.0, method="GET", vhost=vhost)
+            if status != 200 or not body or not body.strip():
+                continue
+            if _is_soft404(cal, status, body, len(body), headers.get("location", "")):
+                continue
+            utils.log("hot", f"backup file: /{cand}", indent=2)
+            host.add(Finding(
+                title=f"{pfx}Source/backup file exposed: /{cand}",
+                detail="Likely the source of the running page — read it for "
+                       "logic flaws and hard-coded credentials.",
+                severity="high", category="leak", port=port, service="http",
+                evidence=url))
+            for label, value, sev in _all_secrets(body):
+                host.add(Finding(
+                    title=f"{pfx}{label} in /{cand}", detail=f"{label} = {value}",
+                    severity=sev, category="cred", port=port, service="http",
+                    evidence=f"{url}: {value}"))
 
 
 def dump_flag_file(host: HostReport, port: int, url: str, body: str,
@@ -480,6 +594,19 @@ def dump_flag_file(host: HostReport, port: int, url: str, body: str,
         detail=(", ".join(tokens) if tokens else display),
         severity="critical", category="flag", port=port, service="http",
         evidence=f"{url}\n{content[:800]}"))
+
+
+def _all_secrets(body: str):
+    """Both env-style and code-idiom secret extraction, deduped by value."""
+    seen = set()
+    for lbl, val, sev in knowledge.extract_secrets(body):
+        if val not in seen:
+            seen.add(val)
+            yield lbl, val, sev
+    for lbl, val, sev in knowledge.extract_code_secrets(body):
+        if val not in seen:
+            seen.add(val)
+            yield lbl, val, sev
 
 
 def _harvest_secrets(host: HostReport, port: int, path: str, body: str,
