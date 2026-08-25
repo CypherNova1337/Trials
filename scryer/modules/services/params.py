@@ -53,15 +53,19 @@ def _run_one(host: HostReport, port: int, pv: str, url: str,
         params = _parse_output(out_path, out)
         if rc != 0 and not params:
             utils.log("dim", f"paramvoid rc={rc}: {(err or '').strip()[:80]}", indent=2)
-        for method, param in params:
-            utils.log("hot", f"param: {param} ({method}) on {url}", indent=2)
-            host.add(Finding(
-                title=f"Hidden parameter: {param}",
-                detail=f"{method} {url}?{param}= — found by paramvoid. Test for "
-                       f"IDOR / LFI / SQLi / SSRF / debug toggles.",
-                severity="medium", category="web", port=port, service="http",
-                evidence=f"{method} {url} :: {param}"))
-        return len(params)
+        if not params:
+            return 0
+        names = sorted({p for _m, p in params})
+        utils.log("hot", f"{len(names)} param(s) on {url}: {', '.join(names)}",
+                  indent=2)
+        # One aggregated finding per endpoint keeps the summary scannable.
+        host.add(Finding(
+            title=f"Hidden parameters on {_short(url)} ({len(names)})",
+            detail=f"{', '.join(names)} — found by paramvoid on {url}. "
+                   f"Test for IDOR / LFI / SQLi / SSRF / debug toggles.",
+            severity="medium", category="web", port=port, service="http",
+            evidence="\n".join(f"{m} {url}?{p}=" for m, p in params)))
+        return len(names)
     finally:
         try:
             os.unlink(out_path)
@@ -111,3 +115,9 @@ def _join(base: str, ep: str) -> str:
         return ep
     from urllib.parse import urljoin
     return urljoin(base.rstrip("/") + "/", ep.lstrip("/"))
+
+
+def _short(url: str) -> str:
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return (p.path or "/") if p.path not in ("", "/") else "/"

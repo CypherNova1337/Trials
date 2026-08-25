@@ -11,13 +11,12 @@ default response — the same size/hash filtering you'd do by hand with ffuf's
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import re
 import socket
 import ssl
 from typing import List, Optional, Tuple
 
-from ...core import utils
+from ...core import utils, tooling
 from ...core.report import HostReport, Finding
 from ...data import knowledge
 
@@ -110,9 +109,35 @@ def brute(host: HostReport, port: int, secure: bool,
                          "(pass -D <domain>, e.g. -D nexus.htb)", indent=1)
         return
 
-    words = wordlist or knowledge.COMMON_VHOSTS
+    words = wordlist or _load_words()
     for base in domains:
         _brute_domain(host, ip, port, secure, base, words, workers)
+
+
+def _load_words(cap: int = 12000) -> List[str]:
+    """Prefer a SecLists vhost/subdomain wordlist; fall back to the built-in
+    curated list when SecLists isn't installed. Capped so a run stays sane."""
+    path = tooling.find_wordlist("vhost")
+    if not path:
+        return knowledge.COMMON_VHOSTS
+    words: List[str] = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                w = line.strip()
+                if w and not w.startswith("#"):
+                    words.append(w)
+                if len(words) >= cap:
+                    break
+    except OSError:
+        return knowledge.COMMON_VHOSTS
+    # Front-load the high-signal curated names, then the wordlist (deduped).
+    seen = set(knowledge.COMMON_VHOSTS)
+    merged = list(knowledge.COMMON_VHOSTS)
+    merged += [w for w in words if w not in seen]
+    utils.log("info", f"vhost wordlist: {len(merged)} names "
+                      f"(SecLists: {path.split('/')[-1]})", indent=1)
+    return merged
 
 
 def _brute_domain(host: HostReport, ip: str, port: int, secure: bool,

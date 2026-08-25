@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding

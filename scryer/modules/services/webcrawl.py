@@ -13,7 +13,7 @@ import re
 import ssl
 import urllib.request
 from html.parser import HTMLParser
-from typing import List, Optional, Set
+from typing import Optional, Set
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding

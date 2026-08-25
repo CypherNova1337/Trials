@@ -219,7 +219,7 @@ def _udp_scan(host: HostReport, ip: str, opts) -> None:
         portid = int(port_el.get("portid"))
         svc_el = port_el.find("service")
         service = svc_el.get("name", "") if svc_el is not None else ""
-        entry = host.add_port(portid, "udp", service, "")
+        host.add_port(portid, "udp", service, "")
         utils.log("good", f"{portid}/udp {service or '?'} ({st})", indent=1)
         host.add(Finding(title=f"Open UDP port {portid}/{service}",
                          severity="info", category="port", port=portid,
