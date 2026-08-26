@@ -156,7 +156,22 @@ def find_wordlist(kind: str) -> Optional[str]:
               "/usr/share/wordlists/rockyou.txt"):
         if os.path.isfile(p) and kind in ("dir", "passwords"):
             return p
-    return None
+    # Last resort: scryer's own bundled lists (always present in the repo).
+    return bundled_wordlist(kind)
+
+
+def bundled_wordlist(kind: str) -> Optional[str]:
+    """Path to a wordlist shipped inside the scryer package.
+
+    kind: 'users' | 'passwords'. These always exist so brute-force command
+    suggestions have something to point at even without SecLists installed.
+    """
+    fname = {"users": "users.txt", "passwords": "passwords.txt"}.get(kind)
+    if not fname:
+        return None
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                        "data", "wordlists", fname)
+    return path if os.path.isfile(path) else None
 
 
 # ---------------------------------------------------------------------------

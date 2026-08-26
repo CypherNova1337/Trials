@@ -9,6 +9,7 @@ import socket
 from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
+from .. import bruteforce
 
 
 def _grab_ftp_flag(host: HostReport, conn, port: int, name: str) -> None:
@@ -86,6 +87,7 @@ def ftp(host: HostReport, port: int) -> None:
             pass
     except ftplib.error_perm:
         utils.log("dim", "anonymous login rejected", indent=2)
+        bruteforce.suggest(host, port, "ftp")
     except Exception as exc:
         utils.log("warn", f"login attempt error: {exc}", indent=2)
     finally:
@@ -137,6 +139,7 @@ def ssh(host: HostReport, port: int) -> None:
                     detail="Candidate for credential brute-forcing.",
                     severity="low", category="service", port=port, service="ssh",
                 ))
+                bruteforce.suggest(host, port, "ssh")
 
 
 def _auth_methods(text: str) -> str:
