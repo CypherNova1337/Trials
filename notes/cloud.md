@@ -8,8 +8,10 @@ follow-up.
 > target (LocalStack/MinIO on an `s3.<domain>` vhost, e.g. HTB Toppers) it
 > automatically runs the anonymous listing with dummy creds. Add `--exploit`
 > and it goes further: confirms the bucket is writable, uploads a PHP webshell,
-> runs `id` through the front-end site to **confirm RCE**, prints the result,
-> then deletes the shell. Dummy creds used throughout:
+> runs `id` through the front-end site to **confirm RCE**, then hunts common
+> flag locations (`/var/www/flag.txt`, `user.txt`, `root.txt`, …) through the
+> shell and **prints the captured flag**, then deletes the shell. Dummy creds
+> used throughout:
 > `AWS_ACCESS_KEY_ID=dummy AWS_SECRET_ACCESS_KEY=dummy`.
 
 ## AWS S3 buckets

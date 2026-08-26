@@ -50,6 +50,7 @@ class HostReport:
     os_guess: Optional[str] = None
     tech_stack: Optional[str] = None
     s3_endpoints: List[Dict[str, Any]] = field(default_factory=list)
+    creds: List[str] = field(default_factory=list)   # recovered plaintext creds
     open_ports: List[Dict[str, Any]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     started: str = field(default_factory=now_iso)
@@ -67,6 +68,20 @@ class HostReport:
 
     def note(self, title: str, **kw) -> None:
         self.findings.append(Finding(title=title, **kw))
+
+    def add_cred(self, value: str) -> None:
+        """Record a recovered plaintext credential for later password-reuse
+        spraying. Skips hash-looking and placeholder values."""
+        v = (value or "").strip()
+        if not v or len(v) > 128 or v in self.creds:
+            return
+        low = v.lower()
+        if low in ("changeme", "password", "null", "none", "true", "false"):
+            pass  # still useful to spray, keep them
+        # Skip pure long hex (that's a hash, not a plaintext password).
+        if len(v) in (32, 40, 64) and all(c in "0123456789abcdefABCDEF" for c in v):
+            return
+        self.creds.append(v)
 
     def add_hostname(self, name: str) -> bool:
         name = name.strip().lower().rstrip(".")
