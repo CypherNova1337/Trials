@@ -16,7 +16,7 @@ from ..data import knowledge
 from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
-    snmp, mail, netshares, sqldb, remote, webcrawl, params)
+    snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit)
 
 
 def _is_ip(name: str) -> bool:
@@ -90,6 +90,12 @@ class Engine:
 
         self._ad_methodology()
         self._os_inference()
+
+        # S3-compatible storage chain: list anonymously always; upload a
+        # webshell + confirm RCE only with --exploit. Runs after vhosts are
+        # mapped so the AWS CLI resolves s3.<domain>.
+        if host.s3_endpoints:
+            s3exploit.run(host, self.opts)
 
         # Turn identified versions into concrete Exploit-DB leads.
         if not getattr(self.opts, "no_searchsploit", False):

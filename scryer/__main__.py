@@ -57,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="run paramvoid parameter discovery on web endpoints "
                           "(implied by --web-brute)")
 
+    exp = p.add_argument_group("exploitation (active — authorized targets only)")
+    exp.add_argument("--exploit", action="store_true",
+                     help="enable active exploit chains: for a writable "
+                          "S3-compatible bucket, upload a webshell and confirm "
+                          "RCE through the front-end site (cleans up after). "
+                          "Anonymous S3 listing runs without this flag.")
+
     out = p.add_argument_group("output")
     out.add_argument("-o", "--output", metavar="DIR",
                      help="write JSON + Markdown reports and commands.sh into DIR")

@@ -74,6 +74,10 @@ def detect_s3_endpoint(host: HostReport, port: int, body: str,
         return
     endpoint = f"http://{vhost}:{port}" if vhost else f"http://{host.resolved_ip}:{port}"
     buckets = re.findall(r"<Name>([^<]+)</Name>", b)
+    # Record it so the exploit chain (s3exploit) can list/upload/verify later.
+    if not any(e.get("endpoint") == endpoint for e in host.s3_endpoints):
+        host.s3_endpoints.append(
+            {"endpoint": endpoint, "vhost": vhost, "buckets": buckets})
     utils.log("hot", f"S3-compatible storage API at {endpoint}", indent=2)
     host.add(Finding(
         title=f"{pfx}S3-compatible storage endpoint (LocalStack/MinIO)",

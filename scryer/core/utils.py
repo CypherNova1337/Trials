@@ -97,17 +97,23 @@ def have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
-def run(cmd, timeout: int = 60, text: bool = True):
+def run(cmd, timeout: int = 60, text: bool = True, env=None):
     """Run an external command, returning (returncode, stdout, stderr).
 
-    Never raises on non-zero exit; returns (-1, '', reason) on failure.
+    Never raises on non-zero exit; returns (-1, '', reason) on failure. When
+    *env* is given it is merged onto the current environment (not replaced).
     """
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update(env)
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=text,
             timeout=timeout,
+            env=full_env,
         )
         return proc.returncode, proc.stdout or "", proc.stderr or ""
     except subprocess.TimeoutExpired:

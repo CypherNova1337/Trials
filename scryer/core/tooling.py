@@ -93,6 +93,8 @@ REGISTRY: List[ExtTool] = [
     ExtTool("mysql", "MySQL client", apt="default-mysql-client", alts=["mariadb"]),
     ExtTool("psql", "PostgreSQL client", apt="postgresql-client"),
     ExtTool("dig", "DNS queries", apt="dnsutils", alts=["host", "nslookup"]),
+    ExtTool("aws", "AWS CLI (S3-compatible bucket exploitation)",
+            apt="awscli", alts=["aws"]),
     # --- exploit intel / wordlists ---
     ExtTool("searchsploit", "offline Exploit-DB search",
             apt="exploitdb", essential=True),

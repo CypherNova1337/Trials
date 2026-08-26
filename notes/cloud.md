@@ -4,6 +4,14 @@ scryer scans web responses for cloud storage URLs (S3/GCS/Azure/DO Spaces) and
 tests any bucket it finds for public/misconfigured access. This is the manual
 follow-up.
 
+> **scryer automation:** when it detects an S3-compatible API served by the
+> target (LocalStack/MinIO on an `s3.<domain>` vhost, e.g. HTB Toppers) it
+> automatically runs the anonymous listing with dummy creds. Add `--exploit`
+> and it goes further: confirms the bucket is writable, uploads a PHP webshell,
+> runs `id` through the front-end site to **confirm RCE**, prints the result,
+> then deletes the shell. Dummy creds used throughout:
+> `AWS_ACCESS_KEY_ID=dummy AWS_SECRET_ACCESS_KEY=dummy`.
+
 ## AWS S3 buckets
 ```bash
 # Public listing? (anonymous)
