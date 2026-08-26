@@ -231,6 +231,28 @@ def extract_code_secrets(text: str):
             yield f"Credential ({name})", value, sev
 
 
+# Hex hash tokens (md5/sha1/sha256) that sit next to a credential keyword —
+# e.g. PHP's `md5($_POST['password']) === "2cb42f8734ea607eefed3b70af13bbd3"`.
+# The keyword gate keeps asset/etag hashes out.
+_HASH_CTX = re.compile(
+    r"(?i)(?:pass(?:word|wd)?|pwd|md5|sha1|sha256|hash|secret|token)"
+    r"[^0-9a-f]{0,40}\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b")
+
+
+def find_hashes(text: str):
+    """Yield distinct password-looking hash tokens found in a credential
+    context (not every 32-hex asset fingerprint)."""
+    if not text:
+        return
+    seen = set()
+    for m in _HASH_CTX.finditer(text):
+        tok = m.group(1)
+        if tok.lower() in seen:
+            continue
+        seen.add(tok.lower())
+        yield tok
+
+
 # Curated virtual-host / subdomain wordlist. On CTF boxes the real foothold
 # frequently hides behind a name-based vhost (git., dev., admin., …) that the
 # default server block hides. Ordered roughly by how often it pays off.

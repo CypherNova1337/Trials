@@ -18,6 +18,7 @@ from typing import Optional, Set
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
 from ...data import knowledge, filetypes
+from .. import bruteforce
 
 
 _UA = "Mozilla/5.0 (compatible; scryer/2.0)"
@@ -134,6 +135,17 @@ def crawl(host: HostReport, port: int, secure: bool,
                 title=f"{pfx}Linked {cat} file: {href}",
                 detail=note, severity=sev, category="leak", port=port,
                 service="http", evidence=href))
+
+    # Parameterized URLs (?x=…) are prime SQLi/param targets — hand over a
+    # ready sqlmap line for the first couple (deduped by the report).
+    param_urls = []
+    for ref in set(parser.links) | endpoints:
+        full = _absolute(base, ref) if not ref.startswith("http") else ref
+        if "?" in full and "=" in full.split("?", 1)[1] and _same_site(base, full):
+            param_urls.append(full)
+    for purl in sorted(set(param_urls))[:2]:
+        target = purl if not vhost else purl.replace(authority, f"{vhost}:{port}")
+        bruteforce.sqlmap(host, port, target)
 
     # Report the interesting endpoints (api/admin/internal/etc.).
     interesting = sorted(e for e in endpoints if _is_interesting(e))

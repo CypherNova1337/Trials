@@ -223,8 +223,13 @@ def enrich(host: HostReport, port: int, secure: bool,
 def scan_body_for_flags(host: HostReport, port: int, source: str, body: str,
                         pfx: str = "") -> None:
     """Spot flag-format tokens (HTB{…}, flag{…}, 32-hex) sitting in a response
-    body / comment and surface them immediately."""
+    body / comment and surface them immediately. Also pulls hard-coded password
+    hashes out of source (e.g. md5(...) === "..."), classifying those as
+    crackable creds rather than flags."""
+    hashes = set(knowledge.find_hashes(body or ""))
     for tok in knowledge.find_flags(body or ""):
+        if tok in hashes:
+            continue  # a hash embedded in code, reported below — not a flag
         # Skip bare 32-hex that is almost certainly an asset hash, not a flag.
         looks_hashy = len(tok) == 32 and "/" not in source and (
             "css" in source or "js" in source or "static" in source)
@@ -237,6 +242,14 @@ def scan_body_for_flags(host: HostReport, port: int, source: str, body: str,
             detail=tok,
             severity="critical", category="flag", port=port, service="http",
             evidence=f"{source}: {tok}"))
+    for h in hashes:
+        utils.log("hot", f"hard-coded hash: {h}", indent=2)
+        host.add(Finding(
+            title=f"{pfx}Hard-coded password hash in source",
+            detail=f"{h} — identify + crack: nth '{h}'; hashcat -m 0 (MD5) "
+                   "hash.txt rockyou.txt. Reuse the plaintext across logins/SSH.",
+            severity="high", category="cred", port=port, service="http",
+            confidence="potential", evidence=f"{source}: {h}"))
 
 
 def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],
@@ -566,10 +579,16 @@ def _forms(host: HostReport, port: int, body: str, secure: bool = False) -> None
         action = parser.login_action or "/login"
         if not action.startswith("/"):
             action = "/" + action.lstrip("./")
+        ufield = parser.login_user_field or "username"
+        pfield = parser.login_pass_field or "password"
         bruteforce.suggest(
             host, port, "http-form", secure=secure, path=action,
-            user_field=parser.login_user_field or "username",
-            pass_field=parser.login_pass_field or "password")
+            user_field=ufield, pass_field=pfield)
+        # A login form is also a prime SQLi target (auth bypass / dump).
+        scheme = "https" if secure else "http"
+        target = f"{scheme}://{host.resolved_ip}:{port}{action}"
+        bruteforce.sqlmap(host, port, target,
+                          data=f"{ufield}=admin&{pfield}=x")
 
 
 def _norm(body: str) -> str:

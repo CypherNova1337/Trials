@@ -6,10 +6,17 @@ from __future__ import annotations
 import ftplib
 import socket
 
+import os
+
 from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
-from .. import bruteforce
+from .. import bruteforce, crack
+
+# Files worth pulling off an anonymous FTP share and cracking/scanning.
+_LOOT_EXTS = (".zip", ".tar.gz", ".tgz", ".tar", ".gz", ".7z", ".rar",
+              ".kdbx", ".sql", ".bak", ".db", ".sqlite", ".sqlite3")
+_MAX_LOOT_BYTES = 40 * 1024 * 1024   # skip enormous files
 
 
 def _grab_ftp_flag(host: HostReport, conn, port: int, name: str) -> None:
@@ -76,13 +83,19 @@ def ftp(host: HostReport, port: int) -> None:
                     service="ftp", evidence=sample,
                 ))
                 for line in listing:
-                    name = line.split()[-1] if line.split() else ""
+                    fields = line.split()
+                    name = fields[-1] if fields else ""
                     low = name.lower()
+                    size = 0
+                    if len(fields) >= 5 and fields[4].isdigit():
+                        size = int(fields[4])
                     if low in knowledge.FLAG_FILES:
                         _grab_ftp_flag(host, conn, port, name)
-                    elif low in ("user.txt", "flag.txt") or name.endswith(
-                            (".txt", ".sql", ".bak", ".zip", ".conf")):
-                        utils.log("hot", f"interesting file: {name}", indent=3)
+                    elif low.endswith(_LOOT_EXTS):
+                        _loot_ftp_file(host, conn, port, name, size)
+                    elif name.endswith((".txt", ".conf", ".config", ".php",
+                                        ".env", ".xml", ".ini")):
+                        _loot_ftp_file(host, conn, port, name, size)
         except Exception:
             pass
     except ftplib.error_perm:
@@ -95,6 +108,39 @@ def ftp(host: HostReport, port: int) -> None:
             conn.quit()
         except Exception:
             pass
+
+
+def _loot_ftp_file(host: HostReport, conn, port: int, name: str, size: int) -> None:
+    """Download an interesting file from anonymous FTP into the loot dir, then
+    crack/extract archives and scan text for flags + credentials."""
+    if size and size > _MAX_LOOT_BYTES:
+        utils.log("dim", f"skipping large file {name} ({size} bytes)", indent=3)
+        return
+    dest_dir = crack.loot_dir(host)
+    dest = os.path.join(dest_dir, os.path.basename(name))
+    chunks = []
+    try:
+        conn.retrbinary(f"RETR {name}", chunks.append, blocksize=8192)
+    except Exception as exc:
+        utils.log("dim", f"couldn't download {name}: {exc}", indent=3)
+        return
+    try:
+        with open(dest, "wb") as fh:
+            fh.write(b"".join(chunks))
+    except OSError:
+        return
+    utils.log("hot", f"downloaded {name} -> {dest}", indent=3)
+    host.add(Finding(
+        title=f"Downloaded from anonymous FTP: {name}",
+        detail=f"Saved to {dest}", severity="medium", category="loot",
+        port=port, service="ftp", evidence=dest))
+
+    low = name.lower()
+    if low.endswith((".zip", ".tar.gz", ".tgz", ".tar", ".gz", ".kdbx")):
+        crack.handle_archive(host, dest, port=port, service="ftp")
+    else:
+        # Text/DB/sql — scan the single file directly.
+        crack.scan_file(host, dest, port=port, service="ftp")
 
 
 # ---------------------------------------------------------------------------

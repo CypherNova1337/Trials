@@ -67,3 +67,24 @@ def suggest(host: HostReport, port: int, service: str,
                f"{pwds.split('/')[-1] if pwds else 'passwords.txt'}. {tip}.",
         severity="info", category="access", port=port,
         service=service, evidence=cmd, confidence="potential"))
+
+
+def sqlmap(host: HostReport, port: int, target: str, data: Optional[str] = None,
+           cookie: Optional[str] = None, pfx: str = "") -> None:
+    """Emit a ready sqlmap command for a parameter that might be SQL-injectable.
+    One per distinct target (report dedup collapses repeats)."""
+    parts = [f"sqlmap -u '{target}'"]
+    if data:
+        parts.append(f"--data='{data}'")
+    if cookie:
+        parts.append(f"--cookie='{cookie}'")
+    parts += ["--batch", "--dbs"]
+    cmd = " ".join(parts)
+    utils.log("info", f"SQLi test ready: {cmd}", indent=2)
+    host.add(Finding(
+        title=f"{pfx}Possible SQL injection point — sqlmap ready",
+        detail=f"{cmd}\n\nIf 'search'/'id'-style params are injectable, dump "
+               "with --dump, or drop straight to a shell by swapping --dbs for "
+               "--os-shell (then upgrade to a reverse shell).",
+        severity="low", category="web", port=port, service="http",
+        confidence="potential", evidence=cmd))
