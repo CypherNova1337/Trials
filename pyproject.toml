@@ -30,3 +30,6 @@ Homepage = "https://github.com/CypherNova1337/Trials"
 
 [tool.setuptools.packages.find]
 include = ["scryer*"]
+
+[tool.setuptools.package-data]
+scryer = ["data/wordlists/*.txt"]

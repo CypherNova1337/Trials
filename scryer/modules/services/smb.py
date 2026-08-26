@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from ...core import utils
+from ...core import utils, tooling
 from ...core.report import HostReport, Finding
 
 
@@ -18,6 +18,7 @@ def enrich(host: HostReport, port: int) -> None:
     utils.section(f"SMB {ip}:{port}")
 
     _nmblookup(host, ip)
+    _signing_check(host, ip, port)
     shares = _list_shares(host, ip)
     if shares:
         _null_read_check(host, ip, port, shares)
@@ -26,6 +27,39 @@ def enrich(host: HostReport, port: int) -> None:
     if not utils.have("smbclient") and not utils.have("nmblookup"):
         utils.log("dim", "no smbclient/nmblookup on PATH — install to enum shares",
                   indent=2)
+
+
+def _signing_check(host: HostReport, ip: str, port: int) -> None:
+    """Report SMB signing status. Signing NOT required == the box is a valid
+    NTLM-relay target, which turns any Responder-captured auth into code exec
+    without ever cracking a hash."""
+    nxc = tooling.resolve("netexec") or tooling.resolve("crackmapexec")
+    if not nxc:
+        return
+    rc, out, err = utils.run([nxc, "smb", ip], timeout=25)
+    blob = (out or "") + (err or "")
+    m = re.search(r"signing\s*[:=]\s*(True|False)", blob, re.I)
+    if not m:
+        return
+    required = m.group(1).lower() == "true"
+    if required:
+        utils.log("dim", "SMB signing required (not relayable)", indent=2)
+        host.add(Finding(
+            title="SMB signing required",
+            detail="Signing is enforced — NTLM relay to this host will fail.",
+            severity="info", category="service", port=port, service="smb"))
+    else:
+        utils.log("hot", "SMB signing NOT required — NTLM relay target", indent=2)
+        host.add(Finding(
+            title="SMB signing not required — NTLM relay possible",
+            detail="This host does not enforce SMB signing, so it is a valid "
+                   "target for NTLM relay. On the local segment, run Responder "
+                   "to poison LLMNR/NBT-NS and capture NetNTLMv2 auth, then "
+                   "relay it here with ntlmrelayx (SMB/HTTP off in Responder): "
+                   f"impacket-ntlmrelayx -t smb://{ip} -smb2support -c whoami. "
+                   "See notes/responder.md. Also crackable offline: hashcat -m 5600.",
+            severity="medium", category="service", port=port, service="smb",
+            confidence="potential", evidence=blob[:400]))
 
 
 def _nmblookup(host: HostReport, ip: str) -> None:

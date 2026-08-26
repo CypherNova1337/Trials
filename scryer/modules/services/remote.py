@@ -7,6 +7,7 @@ import socket
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
+from .. import bruteforce
 
 
 def rdp(host: HostReport, port: int = 3389) -> None:
@@ -26,6 +27,7 @@ def rdp(host: HostReport, port: int = 3389) -> None:
             host.add(Finding(title="RDP NTLM info", detail=out[:300],
                              severity="info", category="host", port=port,
                              service="rdp", evidence=out[:600]))
+    bruteforce.suggest(host, port, "rdp")
 
 
 def vnc(host: HostReport, port: int = 5900) -> None:

@@ -13,6 +13,8 @@ from typing import Dict, List, Optional
 from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge, filetypes
+from .. import bruteforce
+from . import cloud
 
 
 _UA = "Mozilla/5.0 (compatible; scryer/1.0)"
@@ -48,13 +50,41 @@ class _LinkFormParser(HTMLParser):
         self.has_password = False
         self.forms: List[str] = []
         self.scripts: List[str] = []
+        # Details of the login form (the one containing a password field), so
+        # callers can build a hydra http-post-form line.
+        self.login_action = ""
+        self.login_method = "post"
+        self.login_user_field = ""
+        self.login_pass_field = ""
+        self._cur_action = ""
+        self._cur_method = "post"
+        self._cur_user = ""
+        self._cur_pass = ""
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         if tag == "form":
-            self.forms.append(a.get("action", ""))
-        elif tag == "input" and a.get("type", "").lower() == "password":
-            self.has_password = True
+            self._cur_action = a.get("action", "")
+            self._cur_method = (a.get("method", "post") or "post").lower()
+            self._cur_user = ""
+            self._cur_pass = ""
+            self.forms.append(self._cur_action)
+        elif tag == "input":
+            itype = a.get("type", "text").lower()
+            name = a.get("name", "")
+            if itype == "password":
+                self.has_password = True
+                self._cur_pass = name
+                # Commit this form as the login form.
+                self.login_action = self._cur_action
+                self.login_method = self._cur_method
+                self.login_user_field = self._cur_user
+                self.login_pass_field = name
+            elif itype in ("text", "email", "tel", "") and name and not self._cur_user:
+                self._cur_user = name
+                # If the password field was already seen, backfill the user field.
+                if self._cur_pass and not self.login_user_field:
+                    self.login_user_field = name
         elif tag == "script" and a.get("src"):
             self.scripts.append(a["src"])
 
@@ -157,13 +187,15 @@ def enrich(host: HostReport, port: int, secure: bool,
 
     pfx = f"[{vhost}] " if vhost else ""
     _headers_and_tech(host, port, headers, pfx)
+    _server_language(host, port, headers, body, pfx)
     _title_and_meta(host, port, body, pfx)
     _webapp_exploit_hint(host, port, headers, body, pfx)
     _security_headers(host, port, headers, secure)
     _redirect_hostnames(host, port, headers)
     _comments_and_emails(host, port, body, pfx)
     scan_body_for_flags(host, port, base + "/", body, pfx)
-    _forms(host, port, body)
+    cloud.scan(host, port, body, pfx)
+    _forms(host, port, body, secure=secure)
     _content_discovery(host, port, base, vhost)
 
 
@@ -218,6 +250,101 @@ def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],
             utils.kv("cookie", name, indent=4)
             host.add(Finding(title=f"Framework cookie: {name}", severity="info",
                              category="web", port=port, service="http"))
+
+
+def _server_language(host: HostReport, port: int, headers: Dict[str, str],
+                     body: str, pfx: str = "") -> None:
+    """Answer 'what language generates these pages?' by fusing every signal:
+    X-Powered-By, the Server banner, framework cookies, and file extensions
+    linked in the page. Emits one clear, prominent finding."""
+    powered = headers.get("x-powered-by", "")
+    server = headers.get("server", "")
+    cookie = headers.get("set-cookie", "")
+    blob = f"{powered} {server}".lower()
+    ck = cookie.lower()
+    body_low = (body or "")[:200_000].lower()
+
+    langs: Dict[str, str] = {}   # language -> evidence
+
+    def note(lang: str, why: str) -> None:
+        langs.setdefault(lang, why)
+
+    # --- X-Powered-By (most explicit) ---
+    if "php" in blob:
+        note("PHP", f"X-Powered-By/Server: {powered or server}")
+    if "asp.net" in blob or "asp.net" in ck.replace(" ", ""):
+        note("C# / ASP.NET", f"X-Powered-By/Server: {powered or server}")
+    if "express" in blob:
+        note("JavaScript / Node.js (Express)", f"X-Powered-By: {powered}")
+    if "servlet" in blob or "jsp" in blob:
+        note("Java (JSP/Servlet)", f"X-Powered-By: {powered}")
+
+    # --- Server banner tech ---
+    if "iis" in blob and "C# / ASP.NET" not in langs:
+        note("C# / ASP.NET (likely)", f"Server: {server}")
+    if any(w in blob for w in ("werkzeug", "gunicorn", "uwsgi", "flask",
+                               "django", "hypercorn", "uvicorn", "python")):
+        note("Python", f"Server: {server or powered}")
+    if any(w in blob for w in ("tomcat", "jetty", "coyote", "wildfly",
+                               "jboss", "glassfish", "servlet")):
+        note("Java", f"Server: {server}")
+    if "passenger" in blob or "puma" in blob or "unicorn" in blob or "mongrel" in blob:
+        note("Ruby (Rack/Rails)", f"Server: {server}")
+    if "next.js" in blob or "nextjs" in blob:
+        note("JavaScript / Node.js (Next.js)", f"Server: {server or powered}")
+
+    # --- Framework cookies (match cookie NAMES exactly to avoid substring
+    # collisions like sessionid vs JSESSIONID / ASP.NET_SessionId) ---
+    names = {re.split(r"\s*=", tok.strip(), 1)[0].lower()
+             for tok in re.split(r"[;,]", cookie) if "=" in tok}
+    cookie_exact = {
+        "phpsessid": ("PHP", "PHPSESSID cookie"),
+        "ci_session": ("PHP (CodeIgniter)", "ci_session cookie"),
+        "laravel_session": ("PHP (Laravel)", "laravel_session cookie"),
+        "jsessionid": ("Java (JSP/Servlet)", "JSESSIONID cookie"),
+        "asp.net_sessionid": ("C# / ASP.NET", "ASP.NET_SessionId cookie"),
+        "csrftoken": ("Python (Django)", "csrftoken cookie"),
+        "sessionid": ("Python (Django, likely)", "sessionid cookie"),
+        "connect.sid": ("JavaScript / Node.js", "connect.sid cookie"),
+    }
+    for name, (lang, why) in cookie_exact.items():
+        if name in names:
+            note(lang, why)
+    # Prefix-style cookie names.
+    for name in names:
+        if name.startswith("symfony"):
+            note("PHP (Symfony)", "symfony cookie")
+        elif name.startswith("aspsessionid"):
+            note("VBScript/JScript (classic ASP)", "ASPSESSIONID cookie")
+        elif name.startswith("_rails") or name.endswith("_session_id"):
+            note("Ruby (Rails)", "Rails session cookie")
+        elif name.startswith("rack.session"):
+            note("Ruby (Rack)", "rack.session cookie")
+
+    # --- File extensions linked in the page (weak, corroborating signal) ---
+    ext_lang = {".php": "PHP", ".asp": "VBScript/JScript (classic ASP)",
+                ".aspx": "C# / ASP.NET", ".jsp": "Java (JSP)",
+                ".jspx": "Java (JSP)", ".do": "Java (Struts)",
+                ".py": "Python", ".rb": "Ruby", ".cgi": "CGI (Perl/C/shell)",
+                ".pl": "Perl"}
+    for ext, lang in ext_lang.items():
+        if lang in langs:
+            continue
+        if re.search(r'href=["\'][^"\']*' + re.escape(ext) + r'(?:["\'?#])', body_low):
+            note(lang, f"{ext} links on page")
+
+    if not langs:
+        return
+    summary = "; ".join(f"{lang} ({why})" for lang, why in langs.items())
+    primary = next(iter(langs))
+    utils.log("good", f"server-side language: {summary}", indent=2)
+    host.add(Finding(
+        title=f"{pfx}Server-side language: {', '.join(langs)}",
+        detail=f"Page generation stack inferred from response signals — {summary}.",
+        severity="info", category="web", port=port, service="http",
+        evidence=summary))
+    if not host.tech_stack:
+        host.tech_stack = primary
 
 
 def _title_and_meta(host: HostReport, port: int, body: str, pfx: str = "") -> None:
@@ -339,7 +466,7 @@ def _comments_and_emails(host: HostReport, port: int, body: str,
                          category="leak", port=port, service="http"))
 
 
-def _forms(host: HostReport, port: int, body: str) -> None:
+def _forms(host: HostReport, port: int, body: str, secure: bool = False) -> None:
     if not body:
         return
     parser = _LinkFormParser()
@@ -354,6 +481,14 @@ def _forms(host: HostReport, port: int, body: str) -> None:
             severity="low", category="web", port=port, service="http",
         ))
         utils.log("good", "login form present", indent=2)
+        # Hand the operator a ready hydra http-post-form line.
+        action = parser.login_action or "/login"
+        if not action.startswith("/"):
+            action = "/" + action.lstrip("./")
+        bruteforce.suggest(
+            host, port, "http-form", secure=secure, path=action,
+            user_field=parser.login_user_field or "username",
+            pass_field=parser.login_pass_field or "password")
 
 
 def _norm(body: str) -> str:

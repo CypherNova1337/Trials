@@ -48,6 +48,7 @@ class HostReport:
     resolved_ip: Optional[str] = None
     hostnames: List[str] = field(default_factory=list)
     os_guess: Optional[str] = None
+    tech_stack: Optional[str] = None
     open_ports: List[Dict[str, Any]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     started: str = field(default_factory=now_iso)
@@ -126,6 +127,8 @@ def summarize_console(host: HostReport) -> None:
         print(f"  {c('Hostnames', C.GREY)} {', '.join(host.hostnames)}")
     if host.os_guess:
         print(f"  {c('OS guess', C.GREY)}  {host.os_guess}")
+    if host.tech_stack:
+        print(f"  {c('Web stack', C.GREY)} {host.tech_stack}")
     print(f"  {c('Open ports', C.GREY)} {len(host.open_ports)}")
 
     if host.open_ports:
@@ -170,6 +173,8 @@ def to_markdown(host: HostReport, path: str) -> None:
         lines.append(f"- **Hostnames:** {', '.join(f'`{h}`' for h in host.hostnames)}")
     if host.os_guess:
         lines.append(f"- **OS guess:** {host.os_guess}")
+    if host.tech_stack:
+        lines.append(f"- **Web stack:** {host.tech_stack}")
     lines.append(f"- **Scan window:** {host.started} → {host.finished or '?'}")
     lines.append("")
 
