@@ -538,7 +538,21 @@ def _calibrate_404(base: str, vhost: Optional[str]) -> Optional[dict]:
     if ratio < 0.85:
         return None  # responses vary per request — can't filter reliably
     s = samples[0]
-    return {"status": s[0], "body": s[1], "len": s[2], "location": s[3]}
+    return {"status": s[0], "body": s[1], "len": s[2], "location": s[3],
+            "redir_target": _redir_target(s[3])}
+
+
+def _redir_target(location: str) -> str:
+    """scheme://host[:port] of a redirect Location, ignoring path/query.
+
+    A catch-all that preserves $request_uri (nginx `return 301 https://h$uri`)
+    hands back a *different* Location for every path, so comparing the full URL
+    never matches the baseline. Comparing only the target host does."""
+    if not location:
+        return ""
+    from urllib.parse import urlparse
+    p = urlparse(location.strip())
+    return f"{p.scheme}://{p.netloc}".lower() if p.netloc else ""
 
 
 def _is_soft404(cal: Optional[dict], status: int, body: str, body_len: int,
@@ -547,6 +561,10 @@ def _is_soft404(cal: Optional[dict], status: int, body: str, body_len: int,
     if not cal or status != cal["status"]:
         return False
     if status in (301, 302, 307, 308):
+        # Prefer target-host comparison (survives $request_uri-preserving
+        # redirects); fall back to exact match for relative redirects.
+        if cal.get("redir_target"):
+            return _redir_target(location) == cal["redir_target"]
         return location == cal["location"]
     # Real content differs from the catch-all page even at a similar size.
     return _similar(_norm(body), body_len, cal["body"], cal["len"]) >= 0.9
@@ -560,6 +578,19 @@ def _content_discovery(host: HostReport, port: int, base: str,
 
     cal = _calibrate_404(base, vhost)
     if cal:
+        # Whole-site redirect to a different host/scheme (e.g. IP -> https vhost,
+        # or http -> https): every path here is a soft-404 and the real content
+        # lives behind that host, which scryer scans on its own pass. Don't burn
+        # 100 requests re-confirming that — skip with a one-line note.
+        if cal["status"] in (301, 302, 307, 308) and cal.get("redir_target"):
+            from urllib.parse import urlparse
+            cur = urlparse(base)
+            cur_auth = f"{cur.scheme}://{cur.netloc}".lower()
+            if cal["redir_target"] != cur_auth:
+                utils.log("dim", f"all paths redirect to {cal['redir_target']} "
+                                 f"— skipping path probe here (content lives "
+                                 f"behind that host)", indent=2)
+                return
         utils.log("dim", f"catch-all detected (unknown paths -> {cal['status']}); "
                          f"filtering soft-404s", indent=2)
 

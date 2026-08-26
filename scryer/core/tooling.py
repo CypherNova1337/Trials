@@ -151,11 +151,13 @@ def find_wordlist(kind: str) -> Optional[str]:
             path = os.path.normpath(os.path.join(root, rel))
             if os.path.isfile(path):
                 return path
-    # dirb ships with Kali independently of SecLists.
-    for p in ("/usr/share/wordlists/dirb/common.txt",
-              "/usr/share/wordlists/rockyou.txt"):
-        if os.path.isfile(p) and kind in ("dir", "passwords"):
-            return p
+    # Kali ships these independently of SecLists — but only as the right KIND:
+    # dirb/common.txt is a DIRECTORY list (never a password list), rockyou is
+    # passwords. Mismatching them (common.txt as -P) produces broken commands.
+    if kind == "dir" and os.path.isfile("/usr/share/wordlists/dirb/common.txt"):
+        return "/usr/share/wordlists/dirb/common.txt"
+    if kind == "passwords" and os.path.isfile("/usr/share/wordlists/rockyou.txt"):
+        return "/usr/share/wordlists/rockyou.txt"
     # Last resort: scryer's own bundled lists (always present in the repo).
     return bundled_wordlist(kind)
 

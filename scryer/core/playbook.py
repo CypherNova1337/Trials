@@ -40,7 +40,8 @@ class Playbook:
         return None
 
     def _wl(self, kind: str, default: str) -> str:
-        return tooling.find_wordlist(kind) or default
+        return (tooling.find_wordlist(kind)
+                or tooling.bundled_wordlist(kind) or default)
 
     def add(self, group: str, note: str, command: str):
         self.items.append((group, note, command))
@@ -82,12 +83,14 @@ class Playbook:
                      f"ftp {ip} {port}   # try anonymous / anonymous")
             if tooling.resolve("hydra"):
                 self.add("ftp", "brute (loud)",
-                         f"hydra -L users.txt -P {self._wl('passwords','rockyou.txt')} "
-                         f"ftp://{ip}:{port}")
+                         f"hydra -L {self._wl('users','users.txt')} "
+                         f"-P {self._wl('passwords','rockyou.txt')} "
+                         f"ftp://{ip}:{port} -t 8 -f")
         if svc == "ssh" or port in (22, 2222):
             self.add("ssh", "brute (loud, last resort)",
-                     f"hydra -L users.txt -P {self._wl('passwords','rockyou.txt')} "
-                     f"ssh://{ip}:{port}")
+                     f"hydra -L {self._wl('users','users.txt')} "
+                     f"-P {self._wl('passwords','rockyou.txt')} "
+                     f"ssh://{ip}:{port} -t 4 -f")
         if port in (139, 445) or "smb" in svc or "netbios" in svc:
             self._smb(port)
         if port in (389, 636, 3268) or "ldap" in svc:
