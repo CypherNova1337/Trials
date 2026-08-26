@@ -23,6 +23,25 @@ _GENERATOR_RE = re.compile(
     r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', re.IGNORECASE)
 _COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+# Absolute URLs referenced by the page (href/src/action) — a rich source of
+# the box's real domain (e.g. an <img src="http://thetoppers.htb/...">).
+_URL_HOST_RE = re.compile(r"""(?:href|src|action)\s*=\s*["']https?://([a-z0-9.\-]+)""", re.I)
+# TLDs that on a CTF/lab box always mean "this is the target's own vhost".
+_CTF_TLDS = {"htb", "thm", "ctf", "lab", "box", "vl", "offsec", "local",
+             "corp", "internal", "home", "lan", "test", "dev"}
+# Third-party hosts we never want to treat as the target's own domain.
+_DOMAIN_BLOCKLIST = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "yahoo.com",
+    "icloud.com", "protonmail.com", "example.com", "example.org", "email.com",
+    "w3.org", "schema.org", "googleapis.com", "gstatic.com", "google.com",
+    "cloudflare.com", "jquery.com", "bootstrapcdn.com", "jsdelivr.net",
+    "unpkg.com", "fontawesome.com", "github.com", "githubusercontent.com",
+    "wordpress.org", "gravatar.com", "youtube.com", "twitter.com", "x.com",
+    "facebook.com", "instagram.com", "linkedin.com", "mozilla.org",
+}
+_FREEMAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com",
+             "yahoo.com", "icloud.com", "protonmail.com", "aol.com",
+             "mail.com", "example.com"}
 
 # Header -> technology fingerprints.
 _TECH_HEADERS = {
@@ -192,9 +211,11 @@ def enrich(host: HostReport, port: int, secure: bool,
     _webapp_exploit_hint(host, port, headers, body, pfx)
     _security_headers(host, port, headers, secure)
     _redirect_hostnames(host, port, headers)
+    _harvest_domains(host, port, body or "", pfx)
     _comments_and_emails(host, port, body, pfx)
     scan_body_for_flags(host, port, base + "/", body, pfx)
     cloud.scan(host, port, body, pfx)
+    cloud.detect_s3_endpoint(host, port, body, headers, vhost, pfx)
     _forms(host, port, body, secure=secure)
     _content_discovery(host, port, base, vhost)
 
@@ -441,6 +462,66 @@ def _redirect_hostnames(host: HostReport, port: int, headers: Dict[str, str]) ->
 def _looks_like_ip(name: str) -> bool:
     parts = name.split(".")
     return len(parts) == 4 and all(p.isdigit() for p in parts)
+
+
+def _registrable(domain: str) -> str:
+    """Last two labels — the vhost-brute base (thetoppers.htb from x.thetoppers.htb)."""
+    parts = domain.strip(".").lower().split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
+def _plausible_target_domain(domain: str) -> bool:
+    """Is *domain* the box's own domain (worth vhost-brute + /etc/hosts), rather
+    than a third-party CDN / freemail / analytics host?"""
+    domain = domain.strip(".").lower()
+    if not domain or _looks_like_ip(domain) or "." not in domain:
+        return False
+    reg = _registrable(domain)
+    if reg in _DOMAIN_BLOCKLIST or domain in _DOMAIN_BLOCKLIST:
+        return False
+    tld = domain.rsplit(".", 1)[-1]
+    # A CTF/lab TLD is an unambiguous yes.
+    return tld in _CTF_TLDS
+
+
+def _harvest_domains(host: HostReport, port: int, body: str, pfx: str = "") -> None:
+    """Learn the target's own domain from the page so vhost brute has a base to
+    work from — the usual reason a CTF box '404s on the IP but everything lives
+    behind name.htb'. Registers each discovered domain (and its registrable
+    parent) as a hostname; the engine then vhost-brutes and /etc/hosts-maps it.
+    """
+    if not body:
+        return
+    found = set()
+    # 1) Email domains (contact@thetoppers.htb) — strongest signal on a landing
+    #    page. Accept the box's own domain even without a CTF TLD, but never
+    #    public freemail.
+    for email in set(_EMAIL_RE.findall(body)):
+        dom = email.split("@", 1)[-1].lower()
+        if _registrable(dom) in _FREEMAIL:
+            continue
+        if _plausible_target_domain(dom) or _registrable(dom) not in _DOMAIN_BLOCKLIST:
+            found.add(dom)
+    # 2) Absolute URLs the page references (img/script/link/a/form).
+    for hoststr in set(_URL_HOST_RE.findall(body)):
+        if _plausible_target_domain(hoststr):
+            found.add(hoststr.lower())
+
+    for dom in sorted(found):
+        # Register both the fqdn and its registrable parent so vhost brute has a
+        # base regardless of whether the page named a sub or the apex.
+        for name in {dom, _registrable(dom)}:
+            if name and not _looks_like_ip(name) and host.add_hostname(name):
+                utils.log("hot", f"domain from page: "
+                                 f"{utils.c(name, utils.C.CYAN, utils.C.BOLD)} "
+                                 f"-> vhost-brute + /etc/hosts", indent=2)
+                host.add(Finding(
+                    title=f"{pfx}Target domain discovered: {name}",
+                    detail=f"Referenced in the page served on :{port}. Added as "
+                           "a virtual-host base — scryer brute-forces its "
+                           "subdomains and maps it in /etc/hosts.",
+                    severity="info", category="host", port=port, service="http",
+                    evidence=name))
 
 
 def _comments_and_emails(host: HostReport, port: int, body: str,

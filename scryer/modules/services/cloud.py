@@ -57,6 +57,38 @@ def _get(url: str, timeout: float = 8.0) -> Tuple[int, str]:
         return 0, ""
 
 
+def detect_s3_endpoint(host: HostReport, port: int, body: str,
+                       headers: dict, vhost: str = None, pfx: str = "") -> None:
+    """Spot an S3-compatible API served *by the target itself* (LocalStack /
+    MinIO / Ceph on a vhost like s3.box.htb). The tell is an S3 XML root or an
+    'AmazonS3'/'MinIO' Server header. These are a classic foothold: list the
+    buckets anonymously and, if writable, upload a webshell that the main site
+    then serves."""
+    server = (headers or {}).get("server", "").lower()
+    b = body or ""
+    is_s3 = ("<ListAllMyBucketsResult" in b or "<ListBucketResult" in b
+             or "amazons3" in server or "minio" in server
+             or (vhost and vhost.lower().startswith("s3.")
+                 and "<?xml" in b[:200].lower()))
+    if not is_s3:
+        return
+    endpoint = f"http://{vhost}:{port}" if vhost else f"http://{host.resolved_ip}:{port}"
+    buckets = re.findall(r"<Name>([^<]+)</Name>", b)
+    utils.log("hot", f"S3-compatible storage API at {endpoint}", indent=2)
+    host.add(Finding(
+        title=f"{pfx}S3-compatible storage endpoint (LocalStack/MinIO)",
+        detail=f"An S3 API is exposed at {endpoint}"
+               + (f" — buckets: {', '.join(buckets[:10])}." if buckets else ".")
+               + " Enumerate and test write access with the AWS CLI:\n"
+               f"  aws --endpoint-url={endpoint} s3 ls\n"
+               f"  aws --endpoint-url={endpoint} s3 ls s3://<bucket>\n"
+               f"  aws --endpoint-url={endpoint} s3 cp shell.php s3://<bucket>/\n"
+               "If the bucket backs the website's document root, an uploaded "
+               ".php file is a webshell (RCE). See notes/cloud.md.",
+        severity="high", category="cloud", port=port, service="http",
+        confidence="potential", evidence=endpoint))
+
+
 def scan(host: HostReport, port: int, body: str, pfx: str = "") -> None:
     if not body:
         return
