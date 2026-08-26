@@ -30,6 +30,7 @@ class Engine:
         self.host = HostReport(target=target)
         self._dispatched: set = set()
         self._web_enriched: set = set()   # (port, vhost) already web-enriched
+        self._hosts_done: set = set()     # vhost names already /etc/hosts-handled
 
     # -- phases -------------------------------------------------------------
     def run(self) -> HostReport:
@@ -68,12 +69,17 @@ class Engine:
         # First deep pass over discovered services.
         self._dispatch(open_ports)
 
+        # /etc/hosts FIRST: a hostname learned from nmap, a redirect, a TLS
+        # cert, or the page itself is a near-mandatory CTF step and can change
+        # what the server serves. Map it now so the vhost brute and every
+        # by-name probe below resolve it.
+        self._hosts_step()
+
         # Virtual-host brute forcing — the usual foothold on hard web boxes.
         if not self.opts.no_vhost:
             self._vhost_brute()
 
-        # Make discovered vhosts resolvable so the external tools (and the
-        # operator's browser) work; always surface the exact /etc/hosts line.
+        # Map anything the brute just discovered, too.
         self._hosts_step()
 
         # Enrich EVERY known virtual host on the web ports (bounded, deduped).
@@ -102,9 +108,13 @@ class Engine:
                         domain=getattr(self.opts, "vhost_domain", None))
 
     def _hosts_step(self) -> None:
-        names = hostsfile.vhost_names(self.host)
+        # Only act on names we haven't handled yet, so calling this more than
+        # once (early, then after the vhost brute) never double-prints.
+        names = [n for n in hostsfile.vhost_names(self.host)
+                 if n not in self._hosts_done]
         if not names:
             return
+        self._hosts_done.update(names)
         ip = self.host.resolved_ip
         cmd = hostsfile.command(ip, names)
         if getattr(self.opts, "add_hosts", False):
@@ -117,7 +127,7 @@ class Engine:
                               f"--add-hosts): {utils.c(ip + ' ' + ' '.join(names), utils.C.CYAN)}")
         self.host.add(Finding(
             title="Virtual hosts need /etc/hosts entries",
-            detail=cmd,
+            detail=hostsfile.command(ip, hostsfile.vhost_names(self.host)),
             severity="info", category="host",
             evidence=cmd))
 
