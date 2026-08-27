@@ -93,6 +93,7 @@ REGISTRY: List[ExtTool] = [
             apt="john", alts=["/usr/sbin/john"]),
     ExtTool("zip2john", "zip -> john hash converter", apt="john",
             alts=["/usr/sbin/zip2john"]),
+    ExtTool("sqlmap", "automated SQL injection", apt="sqlmap"),
     ExtTool("binwalk", "firmware / embedded-file carver", apt="binwalk"),
     ExtTool("exiftool", "media metadata reader", apt="libimage-exiftool-perl",
             alts=["exiftool"]),

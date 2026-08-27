@@ -16,7 +16,8 @@ from ..data import knowledge
 from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
-    snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit)
+    snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
+    webexploit)
 
 
 def _is_ip(name: str) -> bool:
@@ -97,6 +98,10 @@ class Engine:
         # mapped so the AWS CLI resolves s3.<domain>.
         if host.s3_endpoints:
             s3exploit.run(host, self.opts)
+
+        # Authenticated web exploitation: log in with any recovered credential,
+        # crawl the authed area, and drive sqlmap --os-cmd to a shell + flags.
+        webexploit.run(host, self.opts)
 
         # Turn identified versions into concrete Exploit-DB leads.
         if not getattr(self.opts, "no_searchsploit", False):
