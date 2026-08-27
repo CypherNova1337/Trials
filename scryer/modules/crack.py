@@ -195,11 +195,9 @@ def crack_hash(host: HostReport, h: str, source: str, port: int = 0,
     utils.log("info", f"cracking {fmt} hash with rockyou", indent=3)
     utils.run([john, f"--format={fmt}", f"--wordlist={wl}", hf], timeout=180)
     _rc, show, _ = utils.run([john, f"--format={fmt}", "--show", hf], timeout=30)
-    plain = None
-    for line in (show or "").splitlines():
-        if line.startswith(h + ":"):
-            plain = line.split(":", 1)[1].strip()
-            break
+    # john --show on a bare-hash file prints "?:<plaintext>" (login is '?'), not
+    # "<hash>:<plaintext>", so parse the field after the first colon generically.
+    plain = _parse_john_show(show)
     if plain:
         bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
         print("\n  " + bar)
