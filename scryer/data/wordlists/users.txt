@@ -1,6 +1,3 @@
-# scryer bundled username list — common CTF / HTB / THM accounts.
-# Front-loaded with the highest-hit names. Used for hydra command suggestions
-# and as a fallback when SecLists isn't installed.
 admin
 administrator
 root
