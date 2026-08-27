@@ -211,6 +211,21 @@ def find_wordlist(kind: str) -> Optional[str]:
     return bundled_wordlist(kind)
 
 
+def bundled_shell(name: str) -> Optional[str]:
+    """Path to a bundled webshell in the repo's shells/ dir (terminal.php,
+    cmd.php, ...). Works for a repo checkout / editable install; returns None if
+    not found (e.g. a packaged install without the shells/ tree)."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    roots = [os.environ.get("SCRYER_SHELLS", ""),
+             os.path.join(repo_root, "shells")]
+    for r in roots:
+        if r:
+            p = os.path.join(os.path.expanduser(r), name)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
 def bundled_wordlist(kind: str) -> Optional[str]:
     """Path to a wordlist shipped inside the scryer package.
 
