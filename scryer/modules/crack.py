@@ -17,13 +17,19 @@ prints the exact commands to run by hand.
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import zipfile
 from typing import Optional
 
 from ..core import utils, tooling
 from ..core.report import HostReport, Finding
 from ..data import knowledge
+
+# Files small enough to slurp for forensic analysis.
+_MAX_ANALYZE = 8 * 1024 * 1024
+_B64_RE = re.compile(rb"[A-Za-z0-9+/]{16,}={0,2}")
 
 
 def loot_dir(host: HostReport) -> str:
@@ -181,33 +187,220 @@ def _hint_keepass(host: HostReport, path: str, port: int, service: str, pfx: str
 # --- loot scanning ---------------------------------------------------------
 def scan_dir(host: HostReport, root: str, port: int = 0, service: str = "",
              pfx: str = "") -> None:
-    """Read every text-ish file under *root* and mine it for flags, credentials
-    and hard-coded secrets."""
+    """Mine every file under *root*: text files for flags/creds/secrets, binary
+    and media files through the forensic pass (strings, base64, appended data,
+    carving, metadata)."""
+    if os.path.isfile(root):
+        scan_file(host, root, port, service, pfx)
+        return
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
-            fpath = os.path.join(dirpath, name)
-            try:
-                if os.path.getsize(fpath) > 512_000:
-                    continue
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                    body = fh.read()
-            except OSError:
-                continue
-            rel = os.path.relpath(fpath, root)
-            _scan_text(host, rel, body, port, service, pfx)
+            scan_file(host, os.path.join(dirpath, name), port, service, pfx)
+
+
+def _report_flag(host: HostReport, tok: str, source: str, port: int,
+                 service: str, pfx: str, label: str = "FLAG") -> None:
+    bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
+    print("\n  " + bar)
+    print("  " + utils.c(f"║ {label}: {source}", utils.C.GREEN, utils.C.BOLD))
+    print("  " + utils.c(f"║ {tok}", utils.C.YELLOW, utils.C.BOLD))
+    print("  " + utils.c("╚" + "═" * 56, utils.C.GREEN, utils.C.BOLD) + "\n")
+    host.add(Finding(
+        title=f"{pfx}FLAG recovered: {source}", detail=tok,
+        severity="critical", category="flag", port=port, service=service,
+        evidence=f"{source}: {tok}"))
 
 
 def scan_file(host: HostReport, path: str, port: int = 0, service: str = "",
               pfx: str = "") -> None:
-    """Mine a single recovered file for flags/credentials/secrets."""
+    """Mine a single recovered file. Text -> flags/creds/secrets; binary/media
+    -> the forensic pass."""
     try:
-        if os.path.getsize(path) > 512_000:
+        size = os.path.getsize(path)
+        if size == 0 or size > _MAX_ANALYZE:
             return
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            body = fh.read()
+        with open(path, "rb") as fh:
+            raw = fh.read()
     except OSError:
         return
-    _scan_text(host, os.path.basename(path), body, port, service, pfx)
+    rel = os.path.basename(path)
+    if _looks_text(raw):
+        _scan_text(host, rel, raw.decode("utf-8", "replace"), port, service, pfx)
+    else:
+        _forensics(host, path, rel, raw, port, service, pfx)
+
+
+def _looks_text(raw: bytes) -> bool:
+    sample = raw[:2048]
+    if b"\x00" in sample:
+        return False
+    printable = sum(1 for b in sample if 9 <= b <= 13 or 32 <= b <= 126)
+    return not sample or printable / len(sample) > 0.85
+
+
+def _forensics(host: HostReport, path: str, rel: str, raw: bytes,
+               port: int, service: str, pfx: str) -> None:
+    """Flag-hunt a binary/media file the way you would by hand: ASCII + wide
+    strings, base64 blobs, data appended after an image footer, plus binwalk /
+    exiftool when they're installed."""
+    utils.log("info", f"forensic scan: {rel}", indent=3)
+    found = set()
+
+    def hunt(text: str, source: str):
+        for tok in knowledge.find_flags(text or ""):
+            if tok not in found:
+                found.add(tok)
+                _report_flag(host, tok, source, port, service, pfx)
+
+    # 1) ASCII strings + 2) wide-char (UTF-16 LE/BE) strings.
+    hunt(_ascii_strings(raw), f"{rel} (strings)")
+    hunt(raw.decode("utf-16-le", "ignore"), f"{rel} (utf-16-le)")
+    hunt(raw.decode("utf-16-be", "ignore"), f"{rel} (utf-16-be)")
+
+    # 3) base64-encoded flags (a couple of nested layers).
+    for blob in _B64_RE.findall(raw)[:400]:
+        dec = _b64_multi(blob)
+        if dec:
+            hunt(dec, f"{rel} (base64)")
+
+    # 4) data appended after a standard image/file footer (classic stego).
+    trailing = _trailing_after_footer(raw)
+    if trailing is not None:
+        off, extra = trailing
+        utils.log("hot", f"{rel}: {len(extra)} bytes appended after footer "
+                          f"(offset {off}) — carving", indent=4)
+        host.add(Finding(
+            title=f"{pfx}Appended data after file footer: {rel}",
+            detail=f"{len(extra)} bytes trail the image/file end at offset {off} "
+                   "— extract and inspect (binwalk / dd). Classic stego hiding "
+                   "spot.", severity="high", category="loot", port=port,
+            service=service, evidence=rel))
+        hunt(_ascii_strings(extra), f"{rel} (appended)")
+        for blob in _B64_RE.findall(extra)[:100]:
+            dec = _b64_multi(blob)
+            if dec:
+                hunt(dec, f"{rel} (appended/base64)")
+        # If the appended blob is itself an archive, recurse.
+        carved = path + ".trailer"
+        try:
+            with open(carved, "wb") as fh:
+                fh.write(extra)
+            if extra[:2] == b"PK":
+                handle_archive(host, carved, port, service, pfx)
+        except OSError:
+            pass
+
+    # 5) external carvers / metadata, when present.
+    _binwalk(host, path, rel, port, service, pfx, hunt)
+    _exiftool(host, path, rel, port, service, pfx, hunt)
+
+
+def _ascii_strings(raw: bytes, minlen: int = 4) -> str:
+    out, cur = [], []
+    for b in raw:
+        if 32 <= b <= 126:
+            cur.append(b)
+        else:
+            if len(cur) >= minlen:
+                out.append(bytes(cur).decode("latin-1"))
+            cur = []
+    if len(cur) >= minlen:
+        out.append(bytes(cur).decode("latin-1"))
+    return "\n".join(out)
+
+
+def _b64_multi(blob: bytes, rounds: int = 3) -> str:
+    """Decode up to `rounds` nested base64 layers; return the first decode that
+    yields mostly-printable text (where a flag might hide)."""
+    data = blob
+    best = ""
+    for _ in range(rounds):
+        try:
+            dec = base64.b64decode(data + b"=" * (-len(data) % 4), validate=False)
+        except Exception:
+            break
+        if not dec:
+            break
+        text = dec.decode("latin-1", "replace")
+        printable = sum(1 for c in dec if 9 <= c <= 13 or 32 <= c <= 126)
+        if dec and printable / len(dec) > 0.85:
+            best = text
+            data = dec  # try to peel another layer
+        else:
+            break
+    return best
+
+
+# File-format footers: signature prefix -> footer marker.
+_FOOTERS = [
+    (b"\x89PNG\r\n\x1a\n", b"\x49\x45\x4e\x44\xae\x42\x60\x82"),   # PNG IEND+CRC
+    (b"\xff\xd8\xff", b"\xff\xd9"),                                 # JPEG EOI
+    (b"GIF8", b"\x00\x3b"),                                          # GIF trailer
+]
+
+
+def _trailing_after_footer(raw: bytes):
+    """If the file is a known image type and bytes follow its footer, return
+    (offset, trailing_bytes)."""
+    for sig, footer in _FOOTERS:
+        if raw.startswith(sig):
+            idx = raw.rfind(footer)
+            if idx == -1:
+                return None
+            end = idx + len(footer)
+            if end < len(raw) - 1:   # tolerate a stray padding byte
+                extra = raw[end:]
+                if extra.strip(b"\x00\r\n "):
+                    return end, extra
+            return None
+    return None
+
+
+def _binwalk(host, path, rel, port, service, pfx, hunt) -> None:
+    tool = tooling.resolve("binwalk")
+    if not tool:
+        return
+    outdir = path + ".binwalk"
+    rc, out, _ = utils.run([tool, "--run-as=root", "-e", "--directory", outdir, path],
+                           timeout=120)
+    if rc != 0:
+        # older binwalk without --directory
+        utils.run([tool, "-e", path], timeout=120)
+        outdir = os.path.join(os.path.dirname(path), f"_{rel}.extracted")
+    if out and ("compressed" in out.lower() or "archive" in out.lower()
+                or "zip" in out.lower()):
+        utils.log("good", f"binwalk found embedded data in {rel}", indent=4)
+        host.add(Finding(
+            title=f"{pfx}Embedded files inside {rel} (binwalk)",
+            detail=out[:400], severity="medium", category="loot", port=port,
+            service=service, evidence=rel))
+    if os.path.isdir(outdir):
+        for dp, _d, fs in os.walk(outdir):
+            for f in fs:
+                try:
+                    with open(os.path.join(dp, f), "rb") as fh:
+                        hunt(_ascii_strings(fh.read(_MAX_ANALYZE)),
+                             f"{rel} (binwalk:{f})")
+                except OSError:
+                    pass
+
+
+def _exiftool(host, path, rel, port, service, pfx, hunt) -> None:
+    tool = tooling.resolve("exiftool")
+    if not tool:
+        return
+    rc, out, _ = utils.run([tool, path], timeout=30)
+    if rc == 0 and out:
+        hunt(out, f"{rel} (exif)")
+        # Surface comment/author/description fields explicitly.
+        for line in out.splitlines():
+            low = line.lower()
+            if any(k in low for k in ("comment", "description", "artist",
+                                      "author", "keywords", "user comment")):
+                val = line.split(":", 1)[-1].strip()
+                if val and len(val) > 3:
+                    utils.log("good", f"exif {line.split(':',1)[0].strip()}: "
+                                      f"{val[:60]}", indent=4)
 
 
 def _scan_text(host: HostReport, rel: str, body: str, port: int,

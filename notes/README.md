@@ -18,6 +18,7 @@ meant to be grabbed fast during an engagement.
 | [pivoting.md](pivoting.md) | You need to reach an internal network |
 | [password-cracking.md](password-cracking.md) | You captured a hash/keyfile |
 | [cloud.md](cloud.md) | There are S3/Azure/GCS buckets or cloud metadata |
+| [ctf-oneliners.md](ctf-oneliners.md) | Flag hunting, file forensics/stego, PCAP, crypto/encoding |
 
 **Bundled wordlists** live in [`../scryer/data/wordlists/`](../scryer/data/wordlists):
 `users.txt` (common CTF accounts) and `passwords.txt` (weak/default creds).
