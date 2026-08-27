@@ -59,10 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     exp = p.add_argument_group("exploitation (active — authorized targets only)")
     exp.add_argument("--exploit", action="store_true",
-                     help="enable active exploit chains: for a writable "
-                          "S3-compatible bucket, upload a webshell and confirm "
-                          "RCE through the front-end site (cleans up after). "
-                          "Anonymous S3 listing runs without this flag.")
+                     help="enable active exploit chains: writable S3 bucket -> "
+                          "webshell -> RCE -> flag; and log in with any "
+                          "recovered credential, crawl the authenticated area, "
+                          "and drive sqlmap --os-cmd to a shell + flags. "
+                          "Read-only recon (S3 listing, cracking) runs without "
+                          "this flag.")
 
     out = p.add_argument_group("output")
     out.add_argument("-o", "--output", metavar="DIR",
