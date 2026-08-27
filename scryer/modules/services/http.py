@@ -575,8 +575,12 @@ def _forms(host: HostReport, port: int, body: str, secure: bool = False) -> None
             severity="low", category="web", port=port, service="http",
         ))
         utils.log("good", "login form present", indent=2)
-        # Hand the operator a ready hydra http-post-form line.
-        action = parser.login_action or "/login"
+        # Hand the operator a ready hydra http-post-form line. An empty/self
+        # action posts to the current page ("/"), NOT a guessed "/login" (which
+        # 404s and sends sqlmap/hydra at a dead endpoint).
+        action = (parser.login_action or "/").strip()
+        if action in ("", "#", "."):
+            action = "/"
         if not action.startswith("/"):
             action = "/" + action.lstrip("./")
         ufield = parser.login_user_field or "username"

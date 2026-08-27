@@ -100,7 +100,15 @@ def _crack_zip(host: HostReport, path: str, port: int, service: str,
                pfx: str) -> Optional[str]:
     zip2john = tooling.resolve("zip2john")
     john = tooling.resolve("john")
-    wl = tooling.find_wordlist("passwords")
+    # Cracking needs depth — prefer rockyou over the small spray list.
+    wl = tooling.crack_wordlist()
+    weak = False
+    if not wl:
+        wl = tooling.find_wordlist("passwords")
+        weak = True
+        utils.log("warn", "rockyou.txt not found — cracking with a small list "
+                          "(set $SCRYER_ROCKYOU or install rockyou for real "
+                          "coverage)", indent=3)
     if not (zip2john and john and wl):
         cmd = (f"zip2john {path} > hash.txt && "
                f"john --wordlist={wl or '/usr/share/wordlists/rockyou.txt'} hash.txt "
@@ -143,8 +151,16 @@ def _crack_zip(host: HostReport, path: str, port: int, service: str,
             evidence=f"{path}:{password}"))
         host.add_cred(password)
     else:
-        utils.log("dim", "john didn't crack it with this wordlist — try "
-                         "rockyou + rules, or a bigger list", indent=3)
+        tail = (" — this was the SMALL bundled list; install rockyou (or set "
+                "$SCRYER_ROCKYOU) and re-run for real coverage") if weak else \
+               " — try rockyou + rules (john --rules) or a bigger list"
+        utils.log("dim", f"john didn't crack it{tail}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}Archive not cracked: {os.path.basename(path)}",
+            detail=f"zip2john {path} > h && john --wordlist="
+                   f"{tooling.crack_wordlist() or 'rockyou.txt'} --rules h && "
+                   "john --show h", severity="medium", category="loot",
+            port=port, service=service, confidence="potential", evidence=path))
     return password
 
 
