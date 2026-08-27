@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge, filetypes
-from .. import bruteforce
+from .. import bruteforce, crack
 from . import cloud
 
 
@@ -242,14 +242,9 @@ def scan_body_for_flags(host: HostReport, port: int, source: str, body: str,
             detail=tok,
             severity="critical", category="flag", port=port, service="http",
             evidence=f"{source}: {tok}"))
-    for h in hashes:
+    for h in list(hashes)[:5]:
         utils.log("hot", f"hard-coded hash: {h}", indent=2)
-        host.add(Finding(
-            title=f"{pfx}Hard-coded password hash in source",
-            detail=f"{h} — identify + crack: nth '{h}'; hashcat -m 0 (MD5) "
-                   "hash.txt rockyou.txt. Reuse the plaintext across logins/SSH.",
-            severity="high", category="cred", port=port, service="http",
-            confidence="potential", evidence=f"{source}: {h}"))
+        crack.crack_hash(host, h, source, port, "http", pfx)
 
 
 def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],

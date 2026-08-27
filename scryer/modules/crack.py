@@ -164,6 +164,65 @@ def _crack_zip(host: HostReport, path: str, port: int, service: str,
     return password
 
 
+_JOHN_FMT = {32: "raw-md5", 40: "raw-sha1", 64: "raw-sha256"}
+
+
+def crack_hash(host: HostReport, h: str, source: str, port: int = 0,
+               service: str = "", pfx: str = "") -> Optional[str]:
+    """Try to crack a raw hash (md5/sha1/sha256) with john + rockyou. On success
+    the plaintext is recorded as a credential (and pooled for password reuse);
+    on failure a ready hashcat/john command is left behind."""
+    fmt = _JOHN_FMT.get(len(h))
+    john = tooling.resolve("john")
+    wl = tooling.crack_wordlist()
+    hc_mode = {32: 0, 40: 100, 64: 1400}.get(len(h), 0)
+    if not (fmt and john and wl):
+        host.add(Finding(
+            title=f"{pfx}Hard-coded hash in {source}",
+            detail=f"{h} — crack it: echo {h} > h.txt && hashcat -m {hc_mode} "
+                   "h.txt rockyou.txt   (0=MD5,100=SHA1,1400=SHA256).",
+            severity="medium", category="cred", port=port, service=service,
+            confidence="potential", evidence=f"{source}: {h}"))
+        return None
+
+    import tempfile
+    hf = os.path.join(tempfile.gettempdir(), f"scryer_hash_{h[:12]}.txt")
+    try:
+        with open(hf, "w") as fh:
+            fh.write(h + "\n")
+    except OSError:
+        return None
+    utils.log("info", f"cracking {fmt} hash with rockyou", indent=3)
+    utils.run([john, f"--format={fmt}", f"--wordlist={wl}", hf], timeout=180)
+    _rc, show, _ = utils.run([john, f"--format={fmt}", "--show", hf], timeout=30)
+    plain = None
+    for line in (show or "").splitlines():
+        if line.startswith(h + ":"):
+            plain = line.split(":", 1)[1].strip()
+            break
+    if plain:
+        bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
+        print("\n  " + bar)
+        print("  " + utils.c("║ HASH CRACKED", utils.C.GREEN, utils.C.BOLD))
+        print("  " + utils.c(f"║ {h} ({fmt}) = {plain}", utils.C.YELLOW, utils.C.BOLD))
+        print("  " + utils.c("╚" + "═" * 56, utils.C.GREEN, utils.C.BOLD) + "\n")
+        host.add(Finding(
+            title=f"{pfx}Cracked hash from {source}: {plain}",
+            detail=f"{h} ({fmt}) = '{plain}'. Found in {source}. Try it on the "
+                   "login form / SSH / every service (password reuse).",
+            severity="high", category="cred", port=port, service=service,
+            evidence=f"{source}: {h}={plain}"))
+        host.add_cred(plain)
+    else:
+        host.add(Finding(
+            title=f"{pfx}Hard-coded hash in {source} (not cracked)",
+            detail=f"{h} — john+rockyou missed it; try rules or hashcat -m "
+                   f"{hc_mode} with a bigger list.", severity="medium",
+            category="cred", port=port, service=service,
+            confidence="potential", evidence=f"{source}: {h}"))
+    return plain
+
+
 def _parse_john_show(show: str) -> Optional[str]:
     for line in (show or "").splitlines():
         if ":" in line and not line.strip().endswith("cracked, 0 left") \
@@ -454,12 +513,7 @@ def _scan_text(host: HostReport, rel: str, body: str, port: int,
             port=port, service=service, evidence=f"{rel}: {value}"))
         if "pass" in label.lower() or "credential" in label.lower():
             host.add_cred(value)
-    # Hard-coded hashes (e.g. md5(...) === "..."): report with a crack hint.
-    for h in hashes:
+    # Hard-coded hashes (e.g. md5(...) === "..."): try to crack them outright.
+    for h in list(hashes)[:5]:
         utils.log("hot", f"hash in {rel}: {h}", indent=3)
-        host.add(Finding(
-            title=f"{pfx}Hard-coded hash in {rel}",
-            detail=f"{h} — identify + crack: hashid '{h}'; hashcat -m <mode> "
-                   "(0=MD5) with rockyou.",
-            severity="medium", category="cred", port=port, service=service,
-            confidence="potential", evidence=f"{rel}: {h}"))
+        crack_hash(host, h, rel, port, service, pfx)
