@@ -1,5 +1,12 @@
 # Linux privilege escalation cheat sheet
 
+> **scryer automation:** with `--exploit`, once scryer recovers a credential
+> and SSH is open, it logs in, runs `sudo -l`, matches the allowed binary
+> against its GTFOBins table, prints the exact steps, and tries to read
+> `/root/root.txt` automatically (free-arg binaries via a one-liner; editors
+> like `sudo vi` by driving their shell escape). Editor auto-drive is
+> best-effort — the printed steps are exact if it can't.
+
 ## Automated first
 ```bash
 ./linpeas.sh | tee linpeas.out          # the one-stop tool
