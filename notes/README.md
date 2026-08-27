@@ -10,6 +10,7 @@ meant to be grabbed fast during an engagement.
 | [hydra.md](hydra.md) | You need to brute a login (ssh/ftp/http-form/rdp/smb) |
 | [smb-enum.md](smb-enum.md) | Ports 139/445 are open |
 | [active-directory.md](active-directory.md) | It's a domain controller (88/389/445) |
+| [impacket.md](impacket.md) | Windows creds in hand: MSSQL xp_cmdshell, psexec, roasting, secretsdump |
 | [web-recon.md](web-recon.md) | There's a web app to dig into |
 | [reverse-shells.md](reverse-shells.md) | You have code exec and need a shell back |
 | [file-transfer.md](file-transfer.md) | You need to move tools/loot on or off the box |

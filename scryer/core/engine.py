@@ -17,7 +17,7 @@ from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
-    webexploit, sshprivesc)
+    webexploit, sshprivesc, winattack)
 
 
 def _is_ip(name: str) -> bool:
@@ -106,6 +106,10 @@ class Engine:
         # SSH + sudo/GTFOBins privesc with any recovered credential -> root flag.
         # Runs last so it can use creds looted by the web-exploit phase.
         sshprivesc.run(host, self.opts)
+
+        # Windows: recovered creds -> MSSQL xp_cmdshell RCE + impacket/netexec
+        # spray + privesc playbook.
+        winattack.run(host, self.opts)
 
         # Turn identified versions into concrete Exploit-DB leads.
         if not getattr(self.opts, "no_searchsploit", False):
