@@ -118,11 +118,50 @@ def resolve(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
+def crack_wordlist() -> Optional[str]:
+    """Locate rockyou.txt — the standard deep cracking list — decompressing a
+    packaged rockyou.txt.gz once if that's all that's present. Cracking a zip or
+    a hash needs depth (the small spray list won't cut it: HTB 'Vaccine's
+    backup.zip password 741852963 is in rockyou but not in any top-1000 list)."""
+    direct = [
+        os.path.expanduser("~/Documents/Wordlists/SecLists/Passwords/Leaked-Databases/rockyou.txt"),
+        os.path.expanduser("~/Documents/Wordlists/rockyou.txt"),
+        "/usr/share/wordlists/rockyou.txt",
+        "/usr/share/seclists/Passwords/Leaked-Databases/rockyou.txt",
+        "/usr/share/wordlists/seclists/Passwords/Leaked-Databases/rockyou.txt",
+        os.path.expanduser("~/SecLists/Passwords/Leaked-Databases/rockyou.txt"),
+        os.path.expanduser("~/rockyou.txt"),
+    ]
+    env = os.environ.get("SCRYER_ROCKYOU")
+    if env:
+        direct.insert(0, os.path.expanduser(env))
+    for p in direct:
+        if os.path.isfile(p) and os.path.getsize(p) > 1_000_000:
+            return p
+    # Fall back to a gzipped rockyou (Kali default) — decompress once to cache.
+    import gzip
+    for gz in ("/usr/share/wordlists/rockyou.txt.gz",
+               os.path.expanduser("~/Documents/Wordlists/rockyou.txt.gz")):
+        if os.path.isfile(gz):
+            cache = os.path.join(os.path.expanduser("~/.cache/scryer"), "rockyou.txt")
+            try:
+                if not (os.path.isfile(cache) and os.path.getsize(cache) > 1_000_000):
+                    os.makedirs(os.path.dirname(cache), exist_ok=True)
+                    with gzip.open(gz, "rb") as src, open(cache, "wb") as dst:
+                        dst.write(src.read())
+                return cache
+            except OSError:
+                continue
+    return None
+
+
 def find_wordlist(kind: str) -> Optional[str]:
     """Locate a sensible SecLists wordlist for *kind* if SecLists is present.
 
-    kind: 'dir' | 'vhost' | 'dns' | 'passwords' | 'users'
+    kind: 'dir' | 'vhost' | 'dns' | 'passwords' | 'users' | 'crack'
     """
+    if kind == "crack":
+        return crack_wordlist() or find_wordlist("passwords")
     # Operator's SecLists location first, then env override, then the usual
     # Kali/packaged paths.
     roots = [
