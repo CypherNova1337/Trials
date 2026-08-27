@@ -147,6 +147,11 @@ def crawl(host: HostReport, port: int, secure: bool,
         target = purl if not vhost else purl.replace(authority, f"{vhost}:{port}")
         bruteforce.sqlmap(host, port, target)
 
+    # Parent directories of discovered assets are often the real foothold: a
+    # linked /cdn-cgi/login/script.js means /cdn-cgi/login/ is a login panel the
+    # bare site never links to (HTB Oopsie). Probe those directories.
+    _probe_asset_dirs(host, port, base, parser, endpoints, vhost)
+
     # Report the interesting endpoints (api/admin/internal/etc.).
     interesting = sorted(e for e in endpoints if _is_interesting(e))
     if interesting:
@@ -160,6 +165,61 @@ def crawl(host: HostReport, port: int, secure: bool,
             evidence="\n".join(interesting[:80])))
     # Return endpoints so callers (e.g. paramvoid) can target them.
     return interesting
+
+
+def _probe_asset_dirs(host, port, base, parser, endpoints, vhost) -> None:
+    """GET the parent directories of linked assets/endpoints and flag any that
+    are login panels — the classic hidden foothold (/cdn-cgi/login/)."""
+    from urllib.parse import urlparse
+    dirs = set()
+    for ref in set(parser.links) | set(parser.scripts) | set(endpoints):
+        full = _absolute(base, ref) if not ref.startswith("http") else ref
+        if not _same_site(base, full):
+            continue
+        path = urlparse(full).path
+        # Walk up each path component -> candidate directories.
+        parts = [p for p in path.split("/") if p]
+        for i in range(1, len(parts)):
+            dirs.add("/" + "/".join(parts[:i]) + "/")
+    for d in sorted(dirs):
+        if d in ("/", "/css/", "/js/", "/images/", "/img/", "/fonts/",
+                 "/assets/", "/static/", "/themes/", "/scripts/"):
+            continue
+        body = _get(base + d, vhost)
+        if not body:
+            continue
+        low = body.lower()
+        if 'type="password"' in low or "type='password'" in low or "login" in low:
+            url = (f"http://{vhost}:{port}{d}" if vhost else base + d)
+            if url not in host.login_urls:
+                host.login_urls.append(url)
+            pfx = f"[{vhost}] " if vhost else ""
+            utils.log("hot", f"login panel at {d} (hidden — from asset path)", indent=2)
+            host.add(Finding(
+                title=f"{pfx}Hidden login panel: {d}",
+                detail=f"{url} — a login page the site never links to, found via "
+                       "an asset path. Try default creds / a guest login / SQLi; "
+                       "check for IDOR on any ?id= and role/user cookies "
+                       "(broken access control).",
+                severity="high", category="web", port=port, service="http",
+                evidence=url))
+            guest = _guest_link(body)
+            if guest:
+                host.add(Finding(
+                    title=f"{pfx}Guest login available at {d}",
+                    detail="A 'login as guest' option exists — use it, then look "
+                           "for IDOR (increment ?id=) and cookie role/user "
+                           "tampering to reach admin (Oopsie pattern).",
+                    severity="medium", category="web", port=port, service="http",
+                    confidence="potential", evidence=guest))
+
+
+def _guest_link(body: str) -> str:
+    m = re.search(r'href=["\']([^"\']*)["\'][^>]*>\s*(?:login as )?guest',
+                  body, re.I)
+    if m:
+        return m.group(1)
+    return "guest" if re.search(r"login as guest", body, re.I) else ""
 
 
 def _scrape_js_secrets(host, port, url, body, vhost):
