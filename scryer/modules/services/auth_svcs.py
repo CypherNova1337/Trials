@@ -15,7 +15,10 @@ from .. import bruteforce, crack
 
 # Files worth pulling off an anonymous FTP share and cracking/scanning.
 _LOOT_EXTS = (".zip", ".tar.gz", ".tgz", ".tar", ".gz", ".7z", ".rar",
-              ".kdbx", ".sql", ".bak", ".db", ".sqlite", ".sqlite3")
+              ".kdbx", ".sql", ".bak", ".db", ".sqlite", ".sqlite3",
+              # media/docs — run the forensic (strings/base64/stego) pass
+              ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".pdf", ".doc",
+              ".docx", ".wav", ".mp3", ".pcap", ".pcapng")
 _MAX_LOOT_BYTES = 40 * 1024 * 1024   # skip enormous files
 
 
