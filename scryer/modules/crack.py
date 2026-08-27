@@ -511,6 +511,15 @@ def _scan_text(host: HostReport, rel: str, body: str, port: int,
             port=port, service=service, evidence=f"{rel}: {value}"))
         if "pass" in label.lower() or "credential" in label.lower():
             host.add_cred(value)
+    # PHP DB-connect positional creds (db.php: mysqli_connect(...,'user','pass',...))
+    for duser, dpw in knowledge.find_db_creds(body):
+        utils.log("hot", f"DB credential in {rel}: {duser} / {dpw}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}DB credential in {rel}: {duser}",
+            detail=f"{duser}:{dpw} (from {rel}). Reuse it (su {duser} / SSH).",
+            severity="high", category="cred", port=port, service=service,
+            evidence=f"{rel}: {duser}:{dpw}"))
+        host.add_cred(dpw)
     # Hard-coded hashes (e.g. md5(...) === "..."): try to crack them outright.
     for h in list(hashes)[:5]:
         utils.log("hot", f"hash in {rel}: {h}", indent=3)

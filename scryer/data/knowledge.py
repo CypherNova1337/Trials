@@ -109,6 +109,11 @@ COMMON_WEB_PATHS = [
     "test.php", "info.php", "phpinfo.php", "readme.html", "CHANGELOG.md",
     "composer.json", "package.json", "id_rsa", ".ssh/id_rsa",
     ".well-known/security.txt",
+    # hidden login/admin panels (HTB Oopsie's /cdn-cgi/login, etc.)
+    "cdn-cgi/login/", "cdn-cgi/login/index.php", "cdn-cgi/login/admin.php",
+    "login/", "admin/login", "admin/login.php", "panel/", "panel/login",
+    "dashboard/", "dashboard.php", "portal/", "cms/", "user/login",
+    "auth/login", "account/login", "management/",
     # flag / proof files — grabbed and printed automatically when found
     "flag", "flag.txt", "flags.txt", "user.txt", "root.txt", "proof.txt",
     "user.flag", "root.flag", "flag.php", "flag.html",
@@ -237,6 +242,28 @@ def extract_code_secrets(text: str):
 _HASH_CTX = re.compile(
     r"(?i)(?:pass(?:word|wd)?|pwd|md5|sha1|sha256|hash|secret|token)"
     r"[^0-9a-f]{0,40}\b([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b")
+
+
+# PHP DB-connect idioms with POSITIONAL creds — mysqli_connect('host','user',
+# 'pass','db'), new mysqli(...), pg_connect(...). The labelled-secret regexes
+# miss these because the password isn't named. (HTB Oopsie: db.php ->
+# mysqli_connect('localhost','robert','M3g4C0rpUs3r!','garage').)
+_DBCONN = re.compile(
+    r"""(?ix)(?:mysqli?_connect|new\s+mysqli|pg_connect|new\s+PDO)\s*\(\s*
+        ['"][^'"]*['"]\s*,\s*['"]([^'"]{1,64})['"]\s*,\s*['"]([^'"]{1,128})['"]""")
+
+
+def find_db_creds(text: str):
+    """Yield (username, password) from PHP DB-connect calls with positional args."""
+    if not text:
+        return
+    seen = set()
+    for m in _DBCONN.finditer(text):
+        user, pw = m.group(1), m.group(2)
+        if (user, pw) in seen or _PLACEHOLDER.match(pw):
+            continue
+        seen.add((user, pw))
+        yield user, pw
 
 
 def find_hashes(text: str):

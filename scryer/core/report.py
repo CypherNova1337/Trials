@@ -51,6 +51,7 @@ class HostReport:
     tech_stack: Optional[str] = None
     s3_endpoints: List[Dict[str, Any]] = field(default_factory=list)
     creds: List[str] = field(default_factory=list)   # recovered plaintext creds
+    login_urls: List[str] = field(default_factory=list)  # discovered login panels
     open_ports: List[Dict[str, Any]] = field(default_factory=list)
     findings: List[Finding] = field(default_factory=list)
     started: str = field(default_factory=now_iso)

