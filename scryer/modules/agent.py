@@ -11,9 +11,12 @@ Safety is the whole design here, because the command source is an LLM:
 
   * OFF by default; only runs with --agent, and only when a local model
     (Ollama) is reachable. No cloud, no API key.
-  * Every command must start with an allowlisted offensive/recon tool and must
-    not contain a destructive or system-mutating token (rm, dd, mkfs, shutdown,
-    redirects into system paths, pipe-to-shell, sudo-to-arbitrary, …).
+  * Every command must start with an allowlisted offensive/recon tool (or an
+    interpreter — python/bash/… — for exploit scripts and reverse shells) and
+    must not contain a destructive or system-mutating token (rm, dd, mkfs,
+    shutdown, redirects into system paths, curl|sh, sudo-to-arbitrary, …).
+    With interpreters allowed the denylist is a backstop, not a sandbox —
+    per-command confirmation is the real guard; think twice before --agent-auto.
   * Interactive confirmation before each command by default; --agent-auto runs
     hands-off (still allowlisted). In a non-TTY session without --agent-auto it
     stays a dry run — it prints what it WOULD run and never executes.
@@ -50,11 +53,17 @@ _ALLOWED = {
     "dig", "host", "nslookup", "redis-cli", "mysql", "psql", "mongo", "aws",
     "smbget", "wget", "nbtscan", "crackmapexec", "getent", "finger",
     "cat", "grep", "head", "tail", "strings", "ls", "file", "xxd",
+    # Interpreters — needed for real exploitation (exploit scripts, reverse
+    # shells, pwntools). The destructive-token denylist still applies to the
+    # whole command, and confirmation is the primary guard in interactive mode.
+    "python", "python3", "bash", "sh", "perl", "ruby", "php", "pwncat", "nc",
+    "ncat", "socat", "msfconsole", "msfvenom",
 }
 # Impacket + BloodHound wrappers are allowed by prefix.
 _ALLOWED_PREFIX = ("impacket-", "getnpusers", "getuserspns", "secretsdump",
                    "psexec", "wmiexec", "smbexec", "dcomexec", "atexec",
-                   "bloodhound", "certipy", "ntlmrelayx", "getst", "gettgt")
+                   "bloodhound", "certipy", "ntlmrelayx", "getst", "gettgt",
+                   "python", "ruby", "perl")
 # Any of these anywhere in the command line is an instant reject.
 _DENY = re.compile(
     r"(?i)(\brm\b|\bdd\b|mkfs|shred|wipefs|cryptsetup|fdisk|parted|"
@@ -66,9 +75,7 @@ _DENY = re.compile(
     r":\(\)\s*\{|fork|chmod\s+-R|chown\s+-R|chattr|"
     r"\bmv\s+/|\bcp\s+/dev|passwd\b|useradd|userdel|"
     r"iptables|ufw\b|systemctl|service\s+\w+\s+stop|"
-    r"\beval\b|\bexec\b|base64\s+-d|history\s+-c)")
-_INTERP = {"python", "python3", "perl", "ruby", "php", "bash", "sh", "zsh",
-           "ksh", "node", "awk", "gawk", "lua", "tclsh", "expect"}
+    r"history\s+-c)")
 
 
 def run(host: HostReport, opts) -> None:
@@ -146,8 +153,10 @@ def _prompt(host, history) -> str:
         "host. Respond with EXACTLY ONE next shell command to run, on a single "
         "line, prefixed with 'CMD: '. Use only offensive/recon tools (netexec, "
         "impacket-*, evil-winrm, smbclient, ldapsearch, curl, sqlmap, hashcat, "
-        "ssh/sshpass, nmap, ffuf, showmount, etc.). No interpreters, no "
-        "destructive commands. When you have a user or root flag, or nothing "
+        "ssh/sshpass, nmap, ffuf, showmount, and python/bash for exploit "
+        "scripts or reverse shells). No destructive commands (nothing that "
+        "wipes disks, deletes files, or changes the local system). When you "
+        "have a user or root flag, or nothing "
         "useful is left, respond with 'DONE'. Do not explain.\n\n"
         f"Target: {host.target} ({host.resolved_ip})  OS: {host.os_guess or '?'}\n"
         f"Open ports: {ports}\n"
@@ -201,8 +210,6 @@ def _is_safe(cmd: str) -> Tuple[bool, str]:
         if len(parts) < 2:
             return False, "bare sudo"
     lead = os.path.basename(parts[idx]).lower()
-    if lead in _INTERP:
-        return False, f"interpreter ({lead})"
     if lead in _ALLOWED or any(lead.startswith(p) for p in _ALLOWED_PREFIX):
         return True, "ok"
     return False, f"'{lead}' not in allowlist"
