@@ -17,7 +17,7 @@ from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
-    webexploit, sshprivesc, winattack)
+    webexploit, sshprivesc, winattack, web_debug)
 
 
 def _is_ip(name: str) -> bool:
@@ -115,8 +115,47 @@ class Engine:
         if not getattr(self.opts, "no_searchsploit", False):
             exploitintel.run(host)
 
+        self._write_loot()
         host.finished = utils.now_iso()
         return host
+
+    def _write_loot(self) -> None:
+        """Persist harvested flags / creds / usernames to loot files so the
+        operator (and the generated impacket/hydra commands that reference
+        loot/users.txt) have them on disk."""
+        import os
+        import re as _re
+        host = self.host
+        flags, users, creds = [], [], list(dict.fromkeys(host.creds))
+        for f in host.findings:
+            if f.category == "flag" and f.detail:
+                flags.append(f.detail.strip())
+            if f.category == "cred" and f.evidence and ":" in f.evidence:
+                m = _re.search(r"([A-Za-z0-9._\\-]+):[^\s]+$", f.evidence.strip())
+                if m:
+                    users.append(m.group(1).split("\\")[-1])
+            if "Email/username leak" in f.title:
+                m = _re.search(r"([A-Za-z0-9._-]+)@", f.title)
+                if m:
+                    users.append(m.group(1))
+        flags = list(dict.fromkeys(flags))
+        users = list(dict.fromkeys(users))
+        if not (flags or users or creds):
+            return
+        try:
+            d = os.path.join(os.getcwd(), "scryer_loot", host.resolved_ip or "target")
+            os.makedirs(d, exist_ok=True)
+            for name, items in (("flags.txt", flags), ("users.txt", users),
+                                ("creds.txt", creds)):
+                if items:
+                    with open(os.path.join(d, name), "w") as fh:
+                        fh.write("\n".join(items) + "\n")
+            if flags or creds:
+                utils.log("good", f"loot saved: {d} "
+                                  f"({len(flags)} flags, {len(users)} users, "
+                                  f"{len(creds)} creds)")
+        except OSError:
+            pass
 
     def _vhost_brute(self) -> None:
         host = self.host
@@ -251,6 +290,7 @@ class Engine:
         if secure and vhost is None:
             tls.enrich(host, port)
         http.enrich(host, port, secure=secure, vhost=vhost)
+        web_debug.probe(host, port, secure, vhost=vhost)
         webcrawl.whatweb(host, port, secure, vhost=vhost)
         endpoints = webcrawl.crawl(host, port, secure, vhost=vhost) or []
         if getattr(self.opts, "web_brute", False):

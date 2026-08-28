@@ -281,6 +281,30 @@ def _headers_and_tech(host: HostReport, port: int, headers: Dict[str, str],
                              category="web", port=port, service="http"))
 
 
+def _cookie_names(cookie: str) -> set:
+    """Cookie NAMES from a Set-Cookie header, robust to attribute values that
+    contain commas (Expires=Wed, 21 Oct 2026 ...). A naive split on ',' would
+    corrupt tokenisation, so parse with the stdlib cookie jar first and only
+    fall back to a conservative split."""
+    names = set()
+    try:
+        from http.cookies import SimpleCookie
+        jar = SimpleCookie()
+        jar.load(cookie)
+        names = {k.lower() for k in jar.keys()}
+    except Exception:
+        pass
+    if not names:
+        # Fallback: split on ';' only (never ','), take the token before '='.
+        for tok in cookie.split(";"):
+            if "=" in tok:
+                names.add(tok.split("=", 1)[0].strip().lower())
+    # Attribute keywords are not cookie names.
+    names -= {"expires", "path", "domain", "secure", "httponly", "samesite",
+              "max-age", "version"}
+    return names
+
+
 def _server_language(host: HostReport, port: int, headers: Dict[str, str],
                      body: str, pfx: str = "") -> None:
     """Answer 'what language generates these pages?' by fusing every signal:
@@ -324,8 +348,7 @@ def _server_language(host: HostReport, port: int, headers: Dict[str, str],
 
     # --- Framework cookies (match cookie NAMES exactly to avoid substring
     # collisions like sessionid vs JSESSIONID / ASP.NET_SessionId) ---
-    names = {re.split(r"\s*=", tok.strip(), 1)[0].lower()
-             for tok in re.split(r"[;,]", cookie) if "=" in tok}
+    names = _cookie_names(cookie)
     cookie_exact = {
         "phpsessid": ("PHP", "PHPSESSID cookie"),
         "ci_session": ("PHP (CodeIgniter)", "ci_session cookie"),
@@ -695,9 +718,20 @@ def _content_discovery(host: HostReport, port: int, base: str,
 
     hits = 0
     found_paths = []
-    for path in knowledge.COMMON_WEB_PATHS:
+    # Fetch all candidate paths concurrently (the round-trip latency dominates a
+    # web pass), then process the results in order so output + findings stay
+    # deterministic.
+    import concurrent.futures
+
+    def _probe(path):
         url = f"{base}/{path}"
         status, headers, body = _fetch(url, timeout=5.0, method="GET", vhost=vhost)
+        return path, url, status, headers, body
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(_probe, knowledge.COMMON_WEB_PATHS))
+
+    for path, url, status, headers, body in results:
         if status is None or status not in (200, 401, 403, 301, 302):
             continue
         if _is_soft404(cal, status, body or "", len(body or ""),
