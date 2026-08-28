@@ -120,6 +120,17 @@ scryer 10.10.10.10 --params
 
 # Force the pure-python scanner (no nmap)
 scryer 10.10.10.10 --no-nmap
+
+# Active exploit chains (S3 -> shell, authed login -> SQLi -> shell, ...)
+scryer 10.10.10.10 --exploit
+
+# Jeopardy CTF: analyze a downloaded artifact offline (no network recon)
+scryer --file capture.pcap --flag-format securewv   # traffic + creds + objects
+scryer --file secret.zip                            # crack + extract + scan
+scryer --file challenge.png                         # strings / stego / decode
+
+# Peel encoding layers off a string (base64/32/16/85, hex, ROT-N, XOR, ...)
+scryer --decode 'c2VjdXJld3Z7ZXhhbXBsZX0='
 ```
 
 At the end of every run scryer prints a **Next steps** block of copy-paste
@@ -138,6 +149,10 @@ commands for what it found, and (with `-o`) writes them to
 | `--add-hosts` | Auto-add discovered vhosts (e.g. from an IP→`box.htb` redirect) to `/etc/hosts` so external tools + your browser resolve them |
 | `--web-brute` | Full wordlist dir brute (feroxbuster/ffuf + SecLists) per web port |
 | `--params` | paramvoid parameter discovery on crawled endpoints (implied by `--web-brute`) |
+| `--exploit` | Enable active exploit chains (writable S3 → webshell → RCE; recovered creds → authed SQLi/upload → shell → flag) — authorized targets only |
+| `--file PATH` | Analyze a local Jeopardy artifact offline (pcap/pcapng, zip/tar/kdbx, or any file → forensics + layered decode); no network recon |
+| `--decode STRING` | Peel encoding layers off a string (base64/32/16/85, hex, URL, gzip, ROT-N, Atbash, single-byte XOR) and print any flag |
+| `--flag-format PREFIX` | Event flag prefix (e.g. `securewv`) — sharpens ROT/XOR brute filtering |
 | `--no-searchsploit` | Skip the searchsploit exploit-lookup phase |
 | `-o, --output DIR` | Write JSON + Markdown + `commands.sh` into `DIR` |
 | `-t/-w/--nmap-timeout` | Tune python-scan timeout/threads and the nmap phase timeout |

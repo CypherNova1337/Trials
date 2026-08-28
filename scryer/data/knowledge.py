@@ -139,7 +139,12 @@ FLAG_FILES = {
 # Recognisable flag formats: HTB{...}/flag{...}/CTF{...} and the bare 32-hex
 # HTB-style hash. Used to spot flags inside any response body too.
 FLAG_RE = re.compile(
-    r"(?:[A-Za-z0-9_]{2,20}\{[^}\r\n]{2,120}\}|\b[0-9a-fA-F]{32}\b)")
+    # name{...} tokens, OR a 32-hex flag. The hex uses hex-only look-around
+    # (not \b) so it still matches when command output glues it to following
+    # text, e.g. "...848528The system cannot find..." (wmiexec type of a file
+    # with no trailing newline).
+    r"(?:[A-Za-z0-9_]{2,20}\{[^}\r\n]{2,120}\}"
+    r"|(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F]))")
 
 
 def find_flags(text: str):
