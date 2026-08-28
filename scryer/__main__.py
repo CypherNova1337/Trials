@@ -57,6 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
                      help="run paramvoid parameter discovery on web endpoints "
                           "(implied by --web-brute)")
 
+    art = p.add_argument_group("offline artifacts (Jeopardy CTF)")
+    art.add_argument("--file", metavar="PATH",
+                     help="analyze a local challenge file instead of a host: "
+                          "pcap/pcapng (traffic + creds + carved objects), "
+                          "zip/tar/kdbx (crack + extract + scan), or any other "
+                          "file (forensic strings/stego + layered decode). "
+                          "No network recon is run.")
+    art.add_argument("--decode", metavar="STRING",
+                     help="peel encoding layers off STRING (base64/32/16/85, "
+                          "hex, URL, gzip, ROT-N, Atbash, single-byte XOR) and "
+                          "print any flag found. No target needed.")
+    art.add_argument("--flag-format", metavar="PREFIX",
+                     help="the event's flag prefix, e.g. 'securewv' — improves "
+                          "ROT/XOR brute filtering during decode/artifact runs")
+
     exp = p.add_argument_group("exploitation (active — authorized targets only)")
     exp.add_argument("--exploit", action="store_true",
                      help="enable active exploit chains: writable S3 bucket -> "
@@ -97,8 +112,26 @@ def main(argv=None) -> int:
             tooling.install_missing(assume_yes=args.yes)
         return 0
 
+    # Offline artifact / decode modes — no host, no network recon.
+    if args.flag_format:
+        from .modules import crypto
+        crypto.set_flag_prefix(args.flag_format)
+    if args.decode:
+        from .modules import artifact
+        if not args.quiet:
+            print(utils.banner())
+        flags = artifact.decode(args.decode)
+        return 0 if flags else 2
+    if args.file:
+        from .modules import artifact
+        if not args.quiet:
+            print(utils.banner())
+        flags = artifact.analyze(args.file)
+        return 0 if flags else 2
+
     if not args.target:
-        build_parser().error("a target is required (or use --toolcheck)")
+        build_parser().error("a target is required (or use --toolcheck, "
+                             "--file, or --decode)")
 
     if not args.quiet:
         print(utils.banner())
