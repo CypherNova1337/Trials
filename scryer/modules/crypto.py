@@ -106,6 +106,7 @@ KNOWN_PREFIXES = {"flag", "securewv", "ctf", "htb", "thm", "pctf", "picoctf",
 def set_flag_prefix(prefix: str) -> None:
     if prefix:
         KNOWN_PREFIXES.add(prefix.strip().rstrip("{").lower())
+        knowledge.register_flag_prefix(prefix)
 
 
 def _plausible(tok: str, strict: bool) -> bool:

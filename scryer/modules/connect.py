@@ -19,13 +19,16 @@ Pure standard library (socket + select).
 from __future__ import annotations
 
 import ast
+import hashlib
+import itertools
 import operator
 import re
 import select
 import socket
+import string
 import sys
 import time
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from ..core import utils
 from ..data import knowledge
@@ -63,6 +66,8 @@ def connect(target: str, auto: bool = True, timeout: float = 600.0) -> List[str]
 
     flags: Set[str] = set()
     seen_tokens: Set[str] = set()
+    solved_pow: Set[str] = set()
+    context = ""    # rolling recent text (for multi-line PoW specs)
     sock.setblocking(False)
     deadline = time.time() + timeout
     pending = b""   # partial line buffer for the auto-solver
@@ -86,6 +91,8 @@ def connect(target: str, auto: bool = True, timeout: float = 600.0) -> List[str]
                 _scan(data, flags)
                 if auto:
                     pending = _auto(sock, pending + data, seen_tokens, flags)
+                    context = (context + data.decode("utf-8", "replace"))[-4000:]
+                    _maybe_pow(sock, context, solved_pow)
             if watch_stdin and sys.stdin in r:
                 line = sys.stdin.readline()
                 if not line:
@@ -175,6 +182,154 @@ def _balance(expr: str) -> str:
     while expr.count("(") > expr.count(")"):
         expr = expr.replace("(", "", 1)
     return expr.strip()
+
+
+# --------------------------------------------------------------------------
+# proof-of-work (hashcash / sha256-leading-zeros)
+# --------------------------------------------------------------------------
+_HASH_FNS = {"md5": hashlib.md5, "sha1": hashlib.sha1, "sha256": hashlib.sha256,
+             "sha512": hashlib.sha512}
+_POW_TRIGGER = re.compile(r"(sha-?(?:1|256|512)|md5|hashcash|proof[\s-]*of[\s-]*"
+                          r"work|\bpow\b)", re.I)
+# The kctf / redpwn "curl … pow …" gate has its own tool — detect + advise.
+_KCTF = re.compile(r"(pwn\.red/pow|kctf|redpwn/pow|python3?\s+\S*pow\S*\.py|"
+                   r"\bs\.[A-Za-z0-9+/=]{20,})")
+
+
+def _maybe_pow(sock: socket.socket, context: str, solved: Set[str]) -> None:
+    """Detect a proof-of-work gate in the recent stream and, if it's a
+    brute-forceable hash-with-leading-zeros challenge, solve and answer it."""
+    if not _POW_TRIGGER.search(context):
+        return
+    # Only fire when the service is actually waiting on us (a prompt tail).
+    if not context.rstrip().endswith((":", "?", ">", ")", "=")) \
+            and "\n" not in context[-200:]:
+        return
+    spec = _parse_pow(context)
+    if not spec:
+        if _KCTF.search(context):
+            key = "kctf"
+            if key not in solved:
+                solved.add(key)
+                utils.log("warn", "kctf/redpwn proof-of-work detected — run the "
+                                  "printed `curl … | sh` / pow command in a shell "
+                                  "and paste its answer (not brute-forceable here)")
+        return
+    algo, prefix, nzeros, unit, leading = spec
+    key = f"{algo}:{prefix}:{nzeros}:{unit}:{leading}"
+    if key in solved:
+        return
+    solved.add(key)
+    utils.log("info", f"proof-of-work: {algo} with {nzeros} leading "
+                      f"{'zero bits' if unit == 'bits' else 'hex zeros'}"
+                      + (f" on '{prefix[:24]}'+X" if prefix else "")
+                      + " — solving…")
+    answer = _brute_pow(algo, prefix, nzeros, unit, leading, budget=25.0)
+    if answer is None:
+        utils.log("warn", "proof-of-work exceeded the time budget — solve it "
+                          "manually (difficulty too high for the auto-solver)")
+        return
+    full, suffix = answer
+    send = suffix if prefix else full
+    utils.log("good", f"proof-of-work solved -> {send}")
+    try:
+        sock.sendall((send + "\n").encode())
+    except OSError:
+        pass
+
+
+def _parse_pow(text: str):
+    """Return (algo, prefix, nzeros, unit, leading) or None.
+
+    Handles the common phrasings: 'sha256(prefix + X) starts with N zero bits',
+    'find a string whose sha256 begins with N zeroes', hashcash 'mbN'."""
+    low = text.lower()
+    algo = "sha256"
+    for name in ("sha512", "sha256", "sha1", "md5"):
+        if name in low or name.replace("sha", "sha-") in low:
+            algo = name
+            break
+
+    leading = not any(w in low for w in ("ends with", "trailing", "suffix of the"))
+    unit = "bits" if "bit" in low else "hex"
+
+    n = None
+    m = re.search(r"(\d+)\s*(?:leading\s+)?(?:zero(?:e?s)?|nibble|hex|"
+                  r"char|digit|bit)", low)
+    if m:
+        n = int(m.group(1))
+    else:                              # 'starts with 0000' literal run of zeros
+        m2 = re.search(r"(?:with|:)\s*[\"']?(0{2,})", low)
+        if m2:
+            n = len(m2.group(1))
+            unit = "hex"
+    mh = re.search(r"\bm?b(\d{1,2})\b", low)        # hashcash -mbN
+    if mh and n is None:
+        n, unit = int(mh.group(1)), "bits"
+    if not n or n <= 0 or n > 64:
+        return None
+
+    prefix = _pow_prefix(text)
+    return algo, prefix, n, unit, leading
+
+
+def _pow_prefix(text: str) -> str:
+    """Extract the fixed prefix the server wants prepended, if any."""
+    # sha256(PREFIX + X) / sha256(PREFIX+something) / hash(TOKEN + ...)
+    for pat in (r"(?:prefix|challenge|token|seed|salt)\s*(?:is|=|:)\s*"
+                r"[\"']?([A-Za-z0-9+/=_-]{4,})",
+                # sha256("PREFIX"+X) / sha256(PREFIX + suffix) — tolerate quotes
+                r"sha-?\d*\s*\(\s*[\"']?([A-Za-z0-9+/=_-]{4,})[\"']?\s*\+",
+                # "PREFIX"+X anywhere (quoted literal followed by concatenation)
+                r"[\"']([A-Za-z0-9+/=_-]{4,})[\"']\s*\+\s*[A-Za-z_]",
+                r"starts?\s+with\s+the\s+string\s+[\"']([^\"']+)[\"']",
+                r"\bXXXX\b.*?([A-Za-z0-9]{6,})"):
+        m = re.search(pat, text, re.I)
+        if m:
+            cand = m.group(1)
+            if cand.lower() not in _POW_PLACEHOLDERS:
+                return cand
+    return ""
+
+
+# Formula placeholders that are NOT the actual prefix value.
+_POW_PLACEHOLDERS = {
+    "zero", "zeros", "zeroes", "bits", "the", "prefix", "suffix", "input",
+    "string", "value", "data", "msg", "message", "nonce", "your", "some",
+    "answer", "hash", "result",
+}
+
+
+def _brute_pow(algo: str, prefix: str, nzeros: int, unit: str, leading: bool,
+               budget: float = 25.0) -> Optional[Tuple[str, str]]:
+    fn = _HASH_FNS.get(algo, hashlib.sha256)
+    pre = prefix.encode()
+    end = time.time() + budget
+    # counter -> short printable suffixes, widening length as needed
+    charset = string.ascii_letters + string.digits
+    checked = 0
+    for length in range(1, 12):
+        for combo in itertools.product(charset, repeat=length):
+            suffix = "".join(combo)
+            digest = fn(pre + suffix.encode()).hexdigest()
+            if _zeros_ok(digest, nzeros, unit, leading):
+                return prefix + suffix, suffix
+            checked += 1
+            if checked % 200000 == 0 and time.time() > end:
+                return None
+    return None
+
+
+def _zeros_ok(hexdigest: str, n: int, unit: str, leading: bool) -> bool:
+    if unit == "hex":
+        return (hexdigest.startswith("0" * n) if leading
+                else hexdigest.endswith("0" * n))
+    # bit-level: n leading/trailing zero bits
+    val = int(hexdigest, 16)
+    total = len(hexdigest) * 4
+    if leading:
+        return val >> (total - n) == 0
+    return val & ((1 << n) - 1) == 0
 
 
 def _safe_eval(expr: str):

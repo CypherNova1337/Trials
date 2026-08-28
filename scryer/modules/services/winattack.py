@@ -346,7 +346,7 @@ def _privesc_notes(host, ip) -> None:
 # --- helpers ---------------------------------------------------------------
 def _harvest_flags(host, blob, source) -> bool:
     got = False
-    for tok in knowledge.find_flags(blob or ""):
+    for tok in knowledge.find_flags(blob or "", allow_hex=True):
         got = True
         bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
         print("\n  " + bar)

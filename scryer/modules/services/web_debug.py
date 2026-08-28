@@ -53,11 +53,19 @@ def probe(host: HostReport, port: int, secure: bool, vhost: Optional[str] = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
         results = list(pool.map(get, targets))
 
+    seen_actuator = host.__dict__.setdefault("_actuator_paths", set())
     for path, st, hd, body in results:
         if not st or st >= 400 or not body:
             continue
         low = body.lower()
         if path.startswith(("actuator", "env", "trace")):
+            if not _looks_actuator(path, st, hd, body):
+                continue
+            # Collapse the same endpoint across ports / vhosts / http+https to
+            # one finding — a Spring Boot app answers identically on all of them.
+            if path in seen_actuator:
+                continue
+            seen_actuator.add(path)
             _actuator(host, port, path, base, body, pfx, vhost)
         elif path in _API_DOCS:
             _apidoc(host, port, path, base, body, low, pfx)
@@ -72,6 +80,38 @@ def probe(host: HostReport, port: int, secure: bool, vhost: Optional[str] = None
                        "the PIN is derivable from server details (werkzeug "
                        "debugger PIN exploit).", severity="critical",
                 category="web", port=port, service="http", evidence=f"{base}/{path}"))
+
+
+def _looks_actuator(path, st, hd, body) -> bool:
+    """A real Spring Boot actuator answers 200 with a recognisable JSON shape
+    (or a binary heapdump). Rejects redirect pages / SPA index HTML that merely
+    return a body, which was crowning every 301 an 'actuator'."""
+    if st != 200:
+        return False
+    ct = (hd.get("content-type") or "").lower()
+    head = body.lstrip()[:600].lower()
+    if any(s in head for s in ("<html", "<!doctype", "moved permanently",
+                               "301 ", "302 ", "<head", "<body")):
+        return False
+    if path == "actuator/heapdump":
+        return ("octet-stream" in ct or "hprof" in head
+                or (len(body) > 5000 and "<" not in body[:20]))
+    if "json" not in ct and not head.startswith(("{", "[")):
+        return False
+    markers = {
+        "actuator": ("_links", "actuator", "health"),
+        "actuator/env": ("propertysources", "activeprofiles"),
+        "env": ("propertysources", "activeprofiles"),
+        "actuator/health": ('"status"',),
+        "actuator/mappings": ("mappings", "dispatcherservlet", "contexts"),
+        "actuator/beans": ("beans", "contexts"),
+        "actuator/configprops": ("contexts", "beans", "properties"),
+        "actuator/httptrace": ("traces",),
+        "trace": ("traces", "timestamp", "\"method\""),
+    }
+    need = markers.get(path)
+    low = body.lower()
+    return any(mk in low for mk in need) if need else head.startswith(("{", "["))
 
 
 def _actuator(host, port, path, base, body, pfx, vhost) -> None:
