@@ -155,6 +155,7 @@ commands for what it found, and (with `-o`) writes them to
 | `--params` | paramvoid parameter discovery on crawled endpoints (implied by `--web-brute`) |
 | `--exploit` | Enable active exploit chains (writable S3 → webshell → RCE; recovered creds → authed SQLi/upload → shell → flag; AD spray → WinRM/psexec) — authorized targets only |
 | `--ai` | Ask a locally-hosted LLM (Ollama) to read the recon state and recommend the next step. No API key, no cost, fully offline. `--ai-model NAME` / `$SCRYER_AI_MODEL` picks the model |
+| `--agent` | Autonomous execution loop: the local LLM proposes the next command, scryer safety-checks it against an offensive-tool allowlist, runs it, scans the output for flags/creds, and iterates. Confirms each command unless `--agent-auto`; `--agent-steps N` caps iterations. Needs Ollama; authorized targets only |
 | `--file PATH` | Analyze a local Jeopardy artifact offline (pcap/pcapng, zip/tar/kdbx, or any file → forensics + layered decode); no network recon |
 | `--decode STRING` | Peel encoding layers off a string (base64/32/16/85, hex, URL, gzip, ROT-N, Atbash, single-byte XOR) and print any flag |
 | `--connect HOST:PORT` | Interactive nc-style session to a challenge service: relays your terminal, highlights flags on the wire, auto-answers arithmetic/PoW prompts (`--no-auto` for raw relay) |

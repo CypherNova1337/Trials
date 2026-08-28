@@ -26,6 +26,20 @@ _DEFAULT_ENDPOINT = "http://localhost:11434"
 _DEFAULT_MODEL = "llama3.1"
 
 
+def resolve(args):
+    """Return (endpoint, model) for the local LLM, or None if unreachable."""
+    endpoint = os.environ.get("SCRYER_OLLAMA", _DEFAULT_ENDPOINT).rstrip("/")
+    model = (getattr(args, "ai_model", None) or os.environ.get("SCRYER_AI_MODEL")
+             or _DEFAULT_MODEL)
+    return (endpoint, model) if _reachable(endpoint) else None
+
+
+def ask(args, prompt: str) -> str:
+    """One-shot query to the resolved local model. '' on any failure."""
+    got = resolve(args)
+    return _generate(got[0], got[1], prompt) if got else ""
+
+
 def advise(host: HostReport, args) -> None:
     if not (getattr(args, "ai", False) or os.environ.get("SCRYER_AI")):
         return

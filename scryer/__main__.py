@@ -89,6 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
     ai.add_argument("--ai-model", metavar="NAME", default=None,
                     help="Ollama model for --ai (default: $SCRYER_AI_MODEL or "
                          "llama3.1)")
+    ai.add_argument("--agent", action="store_true",
+                    help="autonomous execution loop: the local LLM proposes the "
+                         "next command, scryer safety-checks and runs it, scans "
+                         "the output for flags/creds, and iterates. Needs "
+                         "Ollama. Confirms each command unless --agent-auto.")
+    ai.add_argument("--agent-auto", action="store_true",
+                    help="with --agent: run each allowlisted command without "
+                         "asking (hands-off). Authorized targets only.")
+    ai.add_argument("--agent-steps", type=int, default=6, metavar="N",
+                    help="max agent-loop iterations (default 6)")
 
     exp = p.add_argument_group("exploitation (active — authorized targets only)")
     exp.add_argument("--exploit", action="store_true",
@@ -181,6 +191,10 @@ def main(argv=None) -> int:
     brain.render_console(host)
     from .modules import aiadvisor
     aiadvisor.advise(host, args)
+
+    # Autonomous execution loop (opt-in, allowlisted, confirmation-first).
+    from .modules import agent
+    agent.run(host, args)
 
     # Build the copy-paste next-step playbook.
     pb = playbook.Playbook(host).build()
