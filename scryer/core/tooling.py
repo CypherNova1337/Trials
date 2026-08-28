@@ -81,6 +81,10 @@ REGISTRY: List[ExtTool] = [
             go="github.com/ropnop/kerbrute@latest"),
     ExtTool("GetNPUsers.py", "AS-REP roasting",
             pipx="impacket", alts=["impacket-GetNPUsers", "GetNPUsers"]),
+    ExtTool("GetUserSPNs.py", "Kerberoasting (Impacket)",
+            pipx="impacket", alts=["impacket-GetUserSPNs", "GetUserSPNs"]),
+    ExtTool("bloodhound-python", "BloodHound AD collector",
+            pipx="bloodhound", alts=["bloodhound.py"]),
     ExtTool("ldapsearch", "LDAP queries", apt="ldap-utils", essential=True),
     ExtTool("evil-winrm", "WinRM shell", apt="evil-winrm"),
     # --- other services ---

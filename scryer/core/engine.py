@@ -17,7 +17,7 @@ from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
-    webexploit, sshprivesc, winattack, web_debug, log4shell)
+    webexploit, sshprivesc, winattack, web_debug, log4shell, adattack)
 
 
 def _is_ip(name: str) -> bool:
@@ -91,6 +91,13 @@ class Engine:
 
         self._ad_methodology()
         self._os_inference()
+
+        # AD attack chain: anonymous enum -> AS-REP roast -> crack -> spray ->
+        # WinRM flag / Kerberoast / BloodHound. Runs before credential reuse and
+        # the Windows-attack pass so every credential it recovers flows into
+        # them (spray -> MSSQL/psexec/wmiexec -> SYSTEM).
+        adattack.run(host, self.opts)
+
         self._credential_reuse()
 
         # S3-compatible storage chain: list anonymously always; upload a
