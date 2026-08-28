@@ -12,6 +12,7 @@ meant to be grabbed fast during an engagement.
 | [active-directory.md](active-directory.md) | It's a domain controller (88/389/445) |
 | [impacket.md](impacket.md) | Windows creds in hand: MSSQL xp_cmdshell, psexec, roasting, secretsdump |
 | [web-recon.md](web-recon.md) | There's a web app to dig into |
+| [log4shell.md](log4shell.md) | A Java app logs your input (UniFi/Solr/VMware) — CVE-2021-44228 |
 | [reverse-shells.md](reverse-shells.md) | You have code exec and need a shell back |
 | [file-transfer.md](file-transfer.md) | You need to move tools/loot on or off the box |
 | [linux-privesc.md](linux-privesc.md) | You're a low-priv user on Linux |
