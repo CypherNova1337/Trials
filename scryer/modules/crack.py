@@ -512,13 +512,16 @@ def _scan_text(host: HostReport, rel: str, body: str, port: int,
         if "pass" in label.lower() or "credential" in label.lower():
             host.add_cred(value)
     # PHP DB-connect positional creds (db.php: mysqli_connect(...,'user','pass',...))
-    for duser, dpw in knowledge.find_db_creds(body):
-        utils.log("hot", f"DB credential in {rel}: {duser} / {dpw}", indent=3)
+    # + ADO/.NET connection strings (dtsConfig/web.config: Password=..;User ID=..).
+    for duser, dpw in list(knowledge.find_db_creds(body)) + list(knowledge.find_conn_creds(body)):
+        acct = duser.split("\\")[-1] if duser else "?"
+        utils.log("hot", f"credential in {rel}: {duser or acct} / {dpw}", indent=3)
         host.add(Finding(
-            title=f"{pfx}DB credential in {rel}: {duser}",
-            detail=f"{duser}:{dpw} (from {rel}). Reuse it (su {duser} / SSH).",
+            title=f"{pfx}Credential in {rel}: {duser or acct}",
+            detail=f"{duser or acct}:{dpw} (from {rel}). Reuse it across "
+                   "SMB/MSSQL/WinRM/SSH — password reuse is the usual pivot.",
             severity="high", category="cred", port=port, service=service,
-            evidence=f"{rel}: {duser}:{dpw}"))
+            evidence=f"{rel}: {duser or acct}:{dpw}"))
         host.add_cred(dpw)
     # Hard-coded hashes (e.g. md5(...) === "..."): try to crack them outright.
     for h in list(hashes)[:5]:

@@ -266,6 +266,35 @@ def find_db_creds(text: str):
         yield user, pw
 
 
+# ADO/.NET/OLE-DB connection strings — "Password=..;User ID=..;" (dtsConfig,
+# web.config, app.config). HTB Archetype: prod.dtsConfig ->
+# Data Source=.;Password=M3g4c0rp123;User ID=ARCHETYPE\sql_svc.
+_CS_PW = re.compile(r"(?i)(?:password|pwd)\s*=\s*([^;'\"<>\s]{1,128})")
+_CS_USER = re.compile(r"(?i)(?:user\s*id|uid|user)\s*=\s*([^;'\"<>\s]{1,128})")
+
+
+def find_conn_creds(text: str):
+    """Yield (user, password) pairs from connection strings. user may be '' if
+    only a password is present."""
+    if not text:
+        return
+    seen = set()
+    for pm in _CS_PW.finditer(text):
+        pw = pm.group(1)
+        if _PLACEHOLDER.match(pw):
+            continue
+        # Pair with the nearest User ID (search a window around the password).
+        window = text[max(0, pm.start() - 200): pm.end() + 200]
+        um = _CS_USER.search(window)
+        user = um.group(1) if um else ""
+        # Strip a DOMAIN\ prefix for the bare account name, keep both.
+        key = (user, pw)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield user, pw
+
+
 def find_hashes(text: str):
     """Yield distinct password-looking hash tokens found in a credential
     context (not every 32-hex asset fingerprint)."""

