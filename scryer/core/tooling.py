@@ -114,6 +114,9 @@ REGISTRY: List[ExtTool] = [
             apt="awscli", alts=["aws"]),
     ExtTool("java", "JRE (runs the rogue-jndi Log4Shell gadget server)",
             apt="default-jre", alts=["java"]),
+    ExtTool("mvn", "Maven (auto-builds the rogue-jndi Log4Shell gadget)",
+            apt="maven"),
+    ExtTool("git", "clone exploit tooling (rogue-jndi, etc.)", apt="git"),
     ExtTool("sshpass", "non-interactive SSH password auth", apt="sshpass"),
     # --- exploit intel / wordlists ---
     ExtTool("searchsploit", "offline Exploit-DB search",

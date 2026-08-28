@@ -131,6 +131,10 @@ scryer --file challenge.png                         # strings / stego / decode
 
 # Peel encoding layers off a string (base64/32/16/85, hex, ROT-N, XOR, ...)
 scryer --decode 'c2VjdXJld3Z7ZXhhbXBsZX0='
+
+# Interactive nc-style session: relays your terminal, watches for flags, and
+# auto-answers arithmetic / proof-of-work gates on the service
+scryer --connect 10.10.10.5:1337
 ```
 
 At the end of every run scryer prints a **Next steps** block of copy-paste
@@ -152,6 +156,7 @@ commands for what it found, and (with `-o`) writes them to
 | `--exploit` | Enable active exploit chains (writable S3 → webshell → RCE; recovered creds → authed SQLi/upload → shell → flag) — authorized targets only |
 | `--file PATH` | Analyze a local Jeopardy artifact offline (pcap/pcapng, zip/tar/kdbx, or any file → forensics + layered decode); no network recon |
 | `--decode STRING` | Peel encoding layers off a string (base64/32/16/85, hex, URL, gzip, ROT-N, Atbash, single-byte XOR) and print any flag |
+| `--connect HOST:PORT` | Interactive nc-style session to a challenge service: relays your terminal, highlights flags on the wire, auto-answers arithmetic/PoW prompts (`--no-auto` for raw relay) |
 | `--flag-format PREFIX` | Event flag prefix (e.g. `securewv`) — sharpens ROT/XOR brute filtering |
 | `--no-searchsploit` | Skip the searchsploit exploit-lookup phase |
 | `-o, --output DIR` | Write JSON + Markdown + `commands.sh` into `DIR` |

