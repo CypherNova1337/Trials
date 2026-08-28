@@ -79,32 +79,42 @@ def run(host: HostReport, opts) -> None:
 
 
 def _impacket_cmd(name):
-    """A runnable command PREFIX (list) for an impacket example, robust to a
-    venv that lacks impacket. Prefer the wrapper (impacket-<name>); else find
-    the .py and pair it with a python interpreter that can actually import
-    impacket (the active venv often can't). Returns None if unrunnable."""
+    """A command PREFIX (list) that ACTUALLY runs an impacket example here.
+
+    Robust to a venv without impacket and to Debian's split packaging (where
+    `import impacket` can succeed but the example still fails). Every candidate
+    is validated by running it with -h and checking for a usage banner with no
+    traceback. Returns None if nothing works."""
     import shutil
     import sys
-    w = shutil.which(f"impacket-{name}") or shutil.which(name)
-    if w and not w.endswith(".py"):
-        return [w]
-    script = shutil.which(f"{name}.py")
-    if not script:
-        for p in (f"/usr/share/doc/python3-impacket/examples/{name}.py",
-                  f"/usr/local/share/doc/python3-impacket/examples/{name}.py",
-                  os.path.expanduser(f"~/impacket/examples/{name}.py")):
-            if os.path.isfile(p):
-                script = p
-                break
-    if w and w.endswith(".py") and not script:
-        script = w
-    if not script:
-        return None
-    for py in ("/usr/bin/python3", shutil.which("python3"), sys.executable):
-        if py:
-            rc, _o, _e = utils.run([py, "-c", "import impacket"], timeout=10)
-            if rc == 0:
-                return [py, script]
+    candidates = []
+    # 1) proper wrappers on PATH (pipx / apt) — impacket-mssqlclient, mssqlclient.py
+    for w in (shutil.which(f"impacket-{name}"), shutil.which(name),
+              shutil.which(f"{name}.py")):
+        if w and not w.endswith(".py"):
+            candidates.append([w])
+    # 2) example .py + every interpreter we can find
+    scripts = [shutil.which(f"{name}.py"),
+               f"/usr/share/doc/python3-impacket/examples/{name}.py",
+               f"/usr/local/share/doc/python3-impacket/examples/{name}.py",
+               os.path.expanduser(f"~/impacket/examples/{name}.py")]
+    pys = [p for p in ("/usr/bin/python3", "/usr/bin/python",
+                       shutil.which("python3"), sys.executable) if p]
+    for sc in scripts:
+        if sc and os.path.isfile(sc):
+            for py in pys:
+                candidates.append([py, sc])
+    # Validate: run -h, require a usage banner and no traceback.
+    seen = set()
+    for cmd in candidates:
+        key = tuple(cmd)
+        if key in seen:
+            continue
+        seen.add(key)
+        rc, out, err = utils.run(cmd + ["-h"], timeout=15)
+        blob = (out or "") + (err or "")
+        if "usage:" in blob.lower() and not _tool_broke(blob):
+            return cmd
     return None
 
 
