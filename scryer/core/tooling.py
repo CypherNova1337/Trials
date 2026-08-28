@@ -112,6 +112,9 @@ REGISTRY: List[ExtTool] = [
     ExtTool("dig", "DNS queries", apt="dnsutils", alts=["host", "nslookup"]),
     ExtTool("aws", "AWS CLI (S3-compatible bucket exploitation)",
             apt="awscli", alts=["aws"]),
+    ExtTool("java", "JRE (runs the rogue-jndi Log4Shell gadget server)",
+            apt="default-jre", alts=["java"]),
+    ExtTool("sshpass", "non-interactive SSH password auth", apt="sshpass"),
     # --- exploit intel / wordlists ---
     ExtTool("searchsploit", "offline Exploit-DB search",
             apt="exploitdb", essential=True),
