@@ -71,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     art.add_argument("--flag-format", metavar="PREFIX",
                      help="the event's flag prefix, e.g. 'securewv' — improves "
                           "ROT/XOR brute filtering during decode/artifact runs")
+    art.add_argument("--connect", metavar="HOST:PORT",
+                     help="open an interactive nc-style session to a challenge "
+                          "service: relays your terminal, watches the stream for "
+                          "flags, and auto-answers arithmetic/proof-of-work "
+                          "prompts. No target needed.")
+    art.add_argument("--no-auto", action="store_true",
+                     help="with --connect: raw relay only (disable the "
+                          "arithmetic/PoW auto-solver)")
 
     exp = p.add_argument_group("exploitation (active — authorized targets only)")
     exp.add_argument("--exploit", action="store_true",
@@ -127,6 +135,12 @@ def main(argv=None) -> int:
         if not args.quiet:
             print(utils.banner())
         flags = artifact.analyze(args.file)
+        return 0 if flags else 2
+    if args.connect:
+        from .modules import connect
+        if not args.quiet:
+            print(utils.banner())
+        flags = connect.connect(args.connect, auto=not args.no_auto)
         return 0 if flags else 2
 
     if not args.target:
