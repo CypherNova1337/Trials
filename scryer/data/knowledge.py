@@ -295,6 +295,33 @@ def find_conn_creds(text: str):
         yield user, pw
 
 
+# Windows command-line credential leaks — PowerShell history / scripts / logs.
+# HTB Archetype: ConsoleHost_history.txt ->
+#   net.exe use T: \\Archetype\backups /user:administrator MEGACORP_4dm1n!!
+_WIN_CRED_PATS = [
+    re.compile(r"(?i)/user:(?:[^\s\\]+\\)?([^\s]+)\s+(\S+)"),          # net use
+    re.compile(r"(?i)\b(?:net user)\s+(\S+)\s+(\S+)"),                  # net user add
+    re.compile(r"(?i)-Credential.*?['\"]([^'\"]+)['\"].*?['\"]([^'\"]+)['\"]"),
+    re.compile(r"(?i)(?:runas).*?/user:(\S+).*?\s(\S+)$"),
+]
+
+
+def find_windows_creds(text: str):
+    """Yield (username, password) from Windows command-line credential leaks."""
+    if not text:
+        return
+    seen = set()
+    for pat in _WIN_CRED_PATS:
+        for m in pat.finditer(text):
+            user, pw = m.group(1), m.group(2)
+            if not user or not pw or _PLACEHOLDER.match(pw) or (user, pw) in seen:
+                continue
+            if pw.lower() in ("add", "/add", "get-content", "gc"):
+                continue
+            seen.add((user, pw))
+            yield user.split("\\")[-1], pw
+
+
 def find_hashes(text: str):
     """Yield distinct password-looking hash tokens found in a credential
     context (not every 32-hex asset fingerprint)."""
