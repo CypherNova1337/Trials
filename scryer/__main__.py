@@ -80,6 +80,16 @@ def build_parser() -> argparse.ArgumentParser:
                      help="with --connect: raw relay only (disable the "
                           "arithmetic/PoW auto-solver)")
 
+    ai = p.add_argument_group("agent / AI advisor (optional, offline)")
+    ai.add_argument("--ai", action="store_true",
+                    help="ask a locally-hosted LLM (Ollama) to read the recon "
+                         "state and recommend the next exploitation step. No API "
+                         "key, no cost — needs Ollama running locally. Also "
+                         "enabled by SCRYER_AI=1.")
+    ai.add_argument("--ai-model", metavar="NAME", default=None,
+                    help="Ollama model for --ai (default: $SCRYER_AI_MODEL or "
+                         "llama3.1)")
+
     exp = p.add_argument_group("exploitation (active — authorized targets only)")
     exp.add_argument("--exploit", action="store_true",
                      help="enable active exploit chains: writable S3 bucket -> "
@@ -164,6 +174,13 @@ def main(argv=None) -> int:
         _restore_progress()
 
     report.summarize_console(host)
+
+    # Ranked ATTACK PLAN (the brain) — the few highest-leverage moves first,
+    # with an optional local-LLM advisor folded in when one is available.
+    from .core import brain
+    brain.render_console(host)
+    from .modules import aiadvisor
+    aiadvisor.advise(host, args)
 
     # Build the copy-paste next-step playbook.
     pb = playbook.Playbook(host).build()

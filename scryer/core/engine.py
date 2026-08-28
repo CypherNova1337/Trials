@@ -302,7 +302,7 @@ class Engine:
         if secure and vhost is None:
             tls.enrich(host, port)
         http.enrich(host, port, secure=secure, vhost=vhost)
-        web_debug.probe(host, port, secure, vhost=vhost)
+        web_debug.probe(host, port, secure, vhost=vhost, opts=self.opts)
         webcrawl.whatweb(host, port, secure, vhost=vhost)
         endpoints = webcrawl.crawl(host, port, secure, vhost=vhost) or []
         if getattr(self.opts, "web_brute", False):
