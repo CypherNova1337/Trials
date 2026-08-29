@@ -129,6 +129,11 @@ class Engine:
         # shell -> Mongo reset -> SSH -> root-flag chain.
         log4shell.run(host, self.opts)
 
+        # Adaptive convergence: facts learned during loot / mail (a webmail host
+        # named in an onboarding PDF, a new credential in a mailbox) feed back
+        # into enumeration + credentialed exploitation until nothing new appears.
+        self._converge()
+
         # Turn identified versions into concrete Exploit-DB leads.
         if not getattr(self.opts, "no_searchsploit", False):
             exploitintel.run(host)
@@ -174,6 +179,21 @@ class Engine:
                                   f"{len(creds)} creds)")
         except OSError:
             pass
+
+    def _converge(self) -> None:
+        """Re-map + web-enrich any hosts discovered mid-run (doc/mail), then
+        re-run credentialed exploitation on the new surface. Bounded so a run
+        can't spin — stops as soon as a pass adds no new hosts or creds."""
+        host = self.host
+        for _ in range(2):
+            h0, c0 = len(host.hostnames), len(host.creds)
+            self._hosts_step()
+            self._enrich_vhosts()           # only enriches not-yet-seen vhosts
+            if host.creds:
+                webexploit.run(host, self.opts)
+                mailloot.run(host, self.opts)   # guarded against identical re-run
+            if len(host.hostnames) == h0 and len(host.creds) == c0:
+                break
 
     def _vhost_brute(self) -> None:
         host = self.host

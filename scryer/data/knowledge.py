@@ -419,6 +419,10 @@ def find_doc_creds(text: str):
         if (not (5 <= len(v) <= 40) or v in seen or v.lower() in _PW_STOP
                 or _PLACEHOLDER.match(v)):
             return False
+        # not an email address or URL (it@enigma.htb, http://...)
+        if (re.search(r"@[\w.-]+\.\w{2,}", v)
+                or v.lower().startswith(("http", "www.", "ftp"))):
+            return False
         # a real credential has a digit, a symbol, or mixed case — this rejects
         # plain prose words ('passwords', 'characters', 'requirements').
         has_digit = any(c.isdigit() for c in v)

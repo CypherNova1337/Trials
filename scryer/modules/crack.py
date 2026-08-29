@@ -435,6 +435,26 @@ def _ooxml_text(path: str) -> str:
     return "\n".join(parts)
 
 
+_HOSTNAME_RE = re.compile(
+    r"(?:https?://)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)", re.I)
+_HOST_TLD_OK = re.compile(r"\.(htb|thm|local|lab|corp|internal|vl|box|ctf)$", re.I)
+
+
+def _harvest_hostnames(text: str):
+    """Pull CTF-plausible hostnames out of document/mail text (URLs or bare
+    FQDNs). Restricted to lab TLDs + subdomains of an already-known style so a
+    real internet domain in the prose isn't chased."""
+    out = set()
+    for m in _HOSTNAME_RE.finditer(text or ""):
+        name = m.group(1).lower().rstrip(".")
+        if name.replace(".", "").isdigit():          # not an IP
+            continue
+        if _HOST_TLD_OK.search(name) and 1 <= name.count(".") <= 4:
+            out.add(name)
+    return out
+
+
 def _dump_doc_text(host: HostReport, rel: str, text: str) -> None:
     """Save the extracted document text to loot and echo a short snippet, so a
     credential phrased in a way the regexes miss is still visible to the
@@ -487,6 +507,19 @@ def _scan_doc_creds(host: HostReport, rel: str, text: str, port: int,
         host.__dict__.setdefault("usernames", set()).update(users)
         utils.log("good", f"{len(users)} candidate username(s) from {rel}: "
                           + ", ".join(sorted(users)[:10]), indent=3)
+    # hostnames / URLs in the doc (e.g. 'Webmail URL: http://mail001.enigma.htb')
+    # -> register them so the engine maps + web-enriches the new host.
+    for hostname in _harvest_hostnames(text):
+        if host.add_hostname(hostname):
+            utils.log("hot", f"host from {rel}: "
+                             f"{utils.c(hostname, utils.C.CYAN, utils.C.BOLD)} "
+                             "-> enumerate", indent=3)
+            host.add(Finding(
+                title=f"{pfx}Host discovered in document: {hostname}",
+                detail=f"{hostname} (referenced in {rel}). scryer maps it and "
+                       "web-enriches it — try the recovered creds on any login "
+                       "there (webmail / portal).", severity="high",
+                category="host", port=port, service=service, evidence=hostname))
 
 
 def _looks_text(raw: bytes) -> bool:
