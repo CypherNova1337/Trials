@@ -395,11 +395,11 @@ def find_windows_creds(text: str):
 # Two complementary strategies: a broadened structured match (password ... : X),
 # and an entropy match (a password-shaped token near a password keyword).
 _DOC_PW_STRUCT = re.compile(
-    r"(?i)(?:password|passwd|passphrase|passcode)\b[^\n:=]{0,60}?"
-    r"[:=]\s*[\"']?([^\s\"'<>]{5,40})")
+    r"(?i)(?:password|passwd|passphrase|passcode|pass|pwd|creds?|credentials?)"
+    r"\b[^\n:=]{0,40}?[:=]\s*[\"']?([^\s\"'<>]{5,40})")
 _PW_CTX = re.compile(
-    r"(?i)(?:password|passwd|passphrase|passcode|credential|"
-    r"temporary|initial|default|login\s+details?)")
+    r"(?i)(?:password|passwd|passphrase|passcode|\bpass\b|\bpwd\b|credential|"
+    r"\bcreds?\b|temporary|\btemp\b|initial|default|login\s+details?)")
 # Words that follow 'password' but are never the password itself.
 _PW_STOP = {
     "policy", "requirements", "must", "should", "will", "shall", "reset",

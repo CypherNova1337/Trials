@@ -206,20 +206,50 @@ def _msg_text(raw: bytes) -> str:
     except Exception:
         return raw.decode("latin-1", "replace")
     parts = [_dh(msg.get("subject", "")), _dh(msg.get("from", ""))]
+    plain, html = [], []
     if msg.is_multipart():
         for p in msg.walk():
-            if p.get_content_type() == "text/plain":
-                try:
-                    parts.append(p.get_payload(decode=True).decode(
-                        "utf-8", "replace"))
-                except Exception:
-                    pass
+            ct = p.get_content_type()
+            if ct == "text/plain":
+                plain.append(_decode_part(p))
+            elif ct == "text/html":
+                html.append(_html_to_text(_decode_part(p)))
     else:
-        try:
-            parts.append(msg.get_payload(decode=True).decode("utf-8", "replace"))
-        except Exception:
-            parts.append(str(msg.get_payload()))
+        payload = _decode_part(msg)
+        if msg.get_content_type() == "text/html":
+            html.append(_html_to_text(payload))
+        else:
+            plain.append(payload)
+    # A lot of onboarding/welcome mail is HTML-only — read that too, don't drop
+    # the whole body just because there's no text/plain part.
+    parts += plain or html
+    if plain and html:
+        parts += html
     return "\n".join(p for p in parts if p)
+
+
+def _decode_part(p) -> str:
+    try:
+        payload = p.get_payload(decode=True)
+        if payload is None:
+            return str(p.get_payload())
+        return payload.decode(p.get_content_charset() or "utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _html_to_text(html: str) -> str:
+    """Strip an HTML body to text, keeping <a href> links (a reset/next-step link
+    is exactly what a welcome email carries)."""
+    import html as _htmlmod
+    if not html:
+        return ""
+    html = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    # surface link targets so they survive tag-stripping
+    html = re.sub(r'(?i)<a\s+[^>]*?href=["\']?([^"\'>\s]+)[^>]*?>', r" \1 ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = _htmlmod.unescape(text)
+    return re.sub(r"[ \t ]{2,}", " ", text).strip()
 
 
 def _dh(value: str) -> str:
@@ -244,8 +274,14 @@ def _report_mailbox(host: HostReport, ip: str, user: str, msgs) -> None:
         return
     utils.log("good", f"{len(msgs)} message(s) in {user}'s mailbox:", indent=2)
     for m in msgs[:12]:
-        first = next((ln.strip() for ln in m.splitlines() if ln.strip()), "")
-        utils.log("dim", f"  • {first[:88]}", indent=2)
+        lines = [ln.strip() for ln in m.splitlines() if ln.strip()]
+        subj = lines[0] if lines else ""
+        utils.log("dim", f"  • {subj[:88]}", indent=2)
+        # show a body snippet too — the next step often hides in the body, not
+        # the subject (and it was invisible before).
+        body = " ".join(lines[2:]) if len(lines) > 2 else ""
+        if body:
+            utils.log("dim", f"      {body[:180]}", indent=2)
     try:
         d = os.path.join(os.getcwd(), "scryer_loot", ip, "mail",
                          re.sub(r"[^A-Za-z0-9._@-]", "_", user))
