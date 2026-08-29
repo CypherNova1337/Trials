@@ -301,12 +301,29 @@ def scan_file(host: HostReport, path: str, port: int = 0, service: str = "",
     # at least non-obvious) streams, and even an uncompressed PDF would be
     # mis-scanned as raw text. Extract the actual text and mine it, then still
     # run the binary forensic pass for stego.
+    is_doc = raw[:5] == b"%PDF-" or (
+        raw[:2] == b"PK" and rel.lower().endswith((".docx", ".xlsx", ".pptx")))
     doc = _extract_doc_text(path, raw)
     if doc:
+        utils.log("good", f"extracted {len(doc)} chars of text from {rel}", indent=3)
+        _dump_doc_text(host, rel, doc)
         _scan_text(host, rel, doc, port, service, pfx)
         _scan_doc_creds(host, rel, doc, port, service, pfx)
         _forensics(host, path, rel, raw, port, service, pfx)
         return
+    if is_doc:
+        # A document we could not read — never fail silently; the whole path may
+        # hinge on it (an onboarding PDF with the password).
+        utils.log("warn", f"{rel} is a document but text extraction returned "
+                          "nothing — open it by hand; for scale install "
+                          "poppler-utils (pdftotext) or `pip install pypdf`",
+                  indent=3)
+        host.add(Finding(
+            title=f"{pfx}Unreadable document (open manually): {rel}",
+            detail=f"{rel} was recovered but scryer could not extract its text. "
+                   "It may hold credentials / the naming convention. Open it: "
+                   "pdftotext / any viewer.", severity="high", category="loot",
+            port=port, service=service, evidence=rel))
     if _looks_text(raw):
         _scan_text(host, rel, raw.decode("utf-8", "replace"), port, service, pfx)
     else:
@@ -329,18 +346,76 @@ def _pdf_text(path: str) -> str:
         rc, out, _ = utils.run([tool, "-q", "-layout", path, "-"], timeout=30)
         if out and out.strip():
             return out
-    try:                                   # fall back to a pure-python reader
-        from pypdf import PdfReader
-    except Exception:
+    try:                                   # pure-python reader, if installed
         try:
-            from PyPDF2 import PdfReader
+            from pypdf import PdfReader
         except Exception:
-            return ""
-    try:
+            from PyPDF2 import PdfReader
         reader = PdfReader(path)
-        return "\n".join((p.extract_text() or "") for p in reader.pages[:50])
+        text = "\n".join((p.extract_text() or "") for p in reader.pages[:50])
+        if text.strip():
+            return text
     except Exception:
+        pass
+    # Zero-dependency fallback so scryer reads onboarding PDFs on a bare box
+    # (no poppler, no pypdf). Handles FlateDecode + uncompressed content streams.
+    try:
+        with open(path, "rb") as fh:
+            return _pdf_text_builtin(fh.read())
+    except OSError:
         return ""
+
+
+def _pdf_text_builtin(raw: bytes) -> str:
+    """Extract visible text from a PDF using only the standard library.
+
+    Walks the file's content streams, zlib-inflates the FlateDecode ones, and
+    pulls the operands of the text-showing operators (Tj / TJ). Good enough for
+    the simple business documents CTF boxes hand out; not a full PDF parser."""
+    import zlib
+    chunks = []
+    pos = 0
+    while True:
+        s = raw.find(b"stream", pos)
+        if s == -1:
+            break
+        start = s + 6
+        if raw[start:start + 2] == b"\r\n":
+            start += 2
+        elif raw[start:start + 1] in (b"\n", b"\r"):
+            start += 1
+        end = raw.find(b"endstream", start)
+        if end == -1:
+            break
+        data = raw[start:end].rstrip(b"\r\n")
+        pos = end + 9
+        try:
+            data = zlib.decompress(data)
+        except Exception:
+            pass                       # already-plain content stream
+        chunks.append(_pdf_ops_text(data))
+    return "\n".join(c for c in chunks if c and c.strip())
+
+
+def _pdf_ops_text(data: bytes) -> str:
+    s = data.decode("latin-1", "replace")
+    out = []
+    # (string) Tj   and   [ (a) -10 (b) ] TJ
+    for m in re.finditer(r"\[((?:[^\[\]\\]|\\.)*)\]\s*TJ"
+                         r"|\(((?:[^()\\]|\\.)*)\)\s*Tj", s):
+        if m.group(2) is not None:
+            out.append(_pdf_unescape(m.group(2)))
+        else:
+            for sm in re.finditer(r"\(((?:[^()\\]|\\.)*)\)", m.group(1)):
+                out.append(_pdf_unescape(sm.group(1)))
+        out.append(" ")
+    return "".join(out)
+
+
+def _pdf_unescape(s: str) -> str:
+    s = (s.replace(r"\(", "(").replace(r"\)", ")").replace(r"\n", "\n")
+          .replace(r"\r", "\r").replace(r"\t", "\t").replace("\\\\", "\\"))
+    return re.sub(r"\\([0-7]{1,3})", lambda m: chr(int(m.group(1), 8) & 0xFF), s)
 
 
 def _ooxml_text(path: str) -> str:
@@ -358,6 +433,23 @@ def _ooxml_text(path: str) -> str:
                 continue
             parts.append(re.sub(r"<[^>]+>", " ", xml))
     return "\n".join(parts)
+
+
+def _dump_doc_text(host: HostReport, rel: str, text: str) -> None:
+    """Save the extracted document text to loot and echo a short snippet, so a
+    credential phrased in a way the regexes miss is still visible to the
+    operator (and to the AI advisor / agent)."""
+    snippet = " ".join(text.split())[:280]
+    utils.log("dim", f"  “{snippet}{'…' if len(text) > 280 else ''}”", indent=3)
+    try:
+        ip = host.resolved_ip or "target"
+        d = os.path.join(os.getcwd(), "scryer_loot", ip, "docs")
+        os.makedirs(d, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", rel) + ".txt"
+        with open(os.path.join(d, safe), "w") as fh:
+            fh.write(text)
+    except OSError:
+        pass
 
 
 def _scan_doc_creds(host: HostReport, rel: str, text: str, port: int,
@@ -389,6 +481,12 @@ def _scan_doc_creds(host: HostReport, rel: str, text: str, port: int,
         host.__dict__.setdefault("emails", set()).update(e.lower() for e in emails)
         utils.log("good", f"{len(emails)} email(s) in {rel}: "
                           + ", ".join(list(emails)[:6]), indent=3)
+    # names + conventions -> a real username list to spray creds over
+    users = knowledge.username_variants(text)
+    if users:
+        host.__dict__.setdefault("usernames", set()).update(users)
+        utils.log("good", f"{len(users)} candidate username(s) from {rel}: "
+                          + ", ".join(sorted(users)[:10]), indent=3)
 
 
 def _looks_text(raw: bytes) -> bool:
