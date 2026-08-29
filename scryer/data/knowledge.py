@@ -437,11 +437,18 @@ def find_doc_creds(text: str):
         if ok(val):
             seen.add(val)
             yield "Password", val
-    # 2) entropy: a password-shaped token just after a password keyword.
+    # 2) entropy: a password-shaped token shortly after a password keyword. Use
+    #    full-text token boundaries (not a sliced window) so a value at the
+    #    window edge isn't truncated (W3bServ!ce2024 -> W3bServ!ce202).
+    tokens = [(tm.start(), tm.group()) for tm in re.finditer(r"\S{8,40}", text)]
     for cm in _PW_CTX.finditer(text):
-        window = text[cm.end(): cm.end() + 90]
-        for tok in re.findall(r"\S{8,40}", window):
-            tok = tok.strip("\"'.,;:()[]<>")
+        lo, hi = cm.end(), cm.end() + 90
+        for start, raw in tokens:
+            if start < lo:
+                continue
+            if start > hi:
+                break
+            tok = raw.strip("\"'.,;:()[]<>")
             if _password_shaped(tok) and ok(tok):
                 seen.add(tok)
                 yield "Password (entropy)", tok
