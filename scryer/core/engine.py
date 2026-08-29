@@ -17,7 +17,8 @@ from ..modules import discovery, ports, fingerprint, nmapscan, exploitintel
 from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
-    webexploit, sshprivesc, winattack, web_debug, log4shell, adattack)
+    webexploit, sshprivesc, winattack, web_debug, log4shell, adattack,
+    mailloot)
 
 
 def _is_ip(name: str) -> bool:
@@ -99,6 +100,11 @@ class Engine:
         adattack.run(host, self.opts)
 
         self._credential_reuse()
+
+        # Mailbox reading: replay recovered creds across learned usernames over
+        # IMAP/POP3 — the mailbox is the usual next hop after an onboarding-doc
+        # or web credential (HTB Enigma: NFS onboarding creds -> IMAP -> flag).
+        mailloot.run(host, self.opts)
 
         # S3-compatible storage chain: list anonymously always; upload a
         # webshell + confirm RCE only with --exploit. Runs after vhosts are

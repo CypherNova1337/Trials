@@ -531,6 +531,8 @@ def _harvest_domains(host: HostReport, port: int, body: str, pfx: str = "") -> N
         dom = email.split("@", 1)[-1].lower()
         if _registrable(dom) in _FREEMAIL:
             continue
+        # Stash the address itself — usernames + mail logins for the mail pass.
+        host.__dict__.setdefault("emails", set()).add(email.lower())
         if _plausible_target_domain(dom) or _registrable(dom) not in _DOMAIN_BLOCKLIST:
             found.add(dom)
     # 2) Absolute URLs the page references (img/script/link/a/form).
