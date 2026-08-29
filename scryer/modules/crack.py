@@ -297,10 +297,98 @@ def scan_file(host: HostReport, path: str, port: int = 0, service: str = "",
     except OSError:
         return
     rel = os.path.basename(path)
+    # Documents (PDF / Office) first — their real text lives in compressed (or
+    # at least non-obvious) streams, and even an uncompressed PDF would be
+    # mis-scanned as raw text. Extract the actual text and mine it, then still
+    # run the binary forensic pass for stego.
+    doc = _extract_doc_text(path, raw)
+    if doc:
+        _scan_text(host, rel, doc, port, service, pfx)
+        _scan_doc_creds(host, rel, doc, port, service, pfx)
+        _forensics(host, path, rel, raw, port, service, pfx)
+        return
     if _looks_text(raw):
         _scan_text(host, rel, raw.decode("utf-8", "replace"), port, service, pfx)
     else:
         _forensics(host, path, rel, raw, port, service, pfx)
+
+
+def _extract_doc_text(path: str, raw: bytes) -> str:
+    """Pull readable text out of a PDF or an OOXML (docx/xlsx/pptx) file."""
+    low = path.lower()
+    if raw[:5] == b"%PDF-" or low.endswith(".pdf"):
+        return _pdf_text(path)
+    if raw[:2] == b"PK" and low.endswith((".docx", ".xlsx", ".pptx")):
+        return _ooxml_text(path)
+    return ""
+
+
+def _pdf_text(path: str) -> str:
+    tool = tooling.resolve("pdftotext")
+    if tool:
+        rc, out, _ = utils.run([tool, "-q", "-layout", path, "-"], timeout=30)
+        if out and out.strip():
+            return out
+    try:                                   # fall back to a pure-python reader
+        from pypdf import PdfReader
+    except Exception:
+        try:
+            from PyPDF2 import PdfReader
+        except Exception:
+            return ""
+    try:
+        reader = PdfReader(path)
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:50])
+    except Exception:
+        return ""
+
+
+def _ooxml_text(path: str) -> str:
+    try:
+        zf = zipfile.ZipFile(path)
+    except (zipfile.BadZipFile, OSError):
+        return ""
+    parts = []
+    for name in zf.namelist():
+        if name.endswith(".xml") and any(
+                k in name for k in ("document", "sharedStrings", "slide", "sheet")):
+            try:
+                xml = zf.read(name).decode("utf-8", "replace")
+            except Exception:
+                continue
+            parts.append(re.sub(r"<[^>]+>", " ", xml))
+    return "\n".join(parts)
+
+
+def _scan_doc_creds(host: HostReport, rel: str, text: str, port: int,
+                    service: str, pfx: str) -> None:
+    """Loose credential/username mining for onboarding-style documents, where a
+    password sits in prose ('Default password: Welcome2Corp!') rather than in a
+    config-file idiom. Also harvests emails/usernames for the mail + spray pass."""
+    for label, value in knowledge.find_doc_creds(text):
+        if label == "Username scheme":
+            utils.log("good", f"username scheme in {rel}: {value}", indent=3)
+            host.add(Finding(
+                title=f"{pfx}Username scheme in document {rel}",
+                detail=f"{value} (from {rel}). Derive the mailbox/SSH usernames "
+                       "from this and spray the password below.",
+                severity="info", category="host", port=port, service=service,
+                evidence=value))
+            continue
+        utils.log("hot", f"{label} in {rel}: {value}", indent=3)
+        host.add(Finding(
+            title=f"{pfx}{label} in document {rel}",
+            detail=f"{value} (from {rel}). Try it over SSH / IMAP / the web "
+                   "login, sprayed across the usernames below.",
+            severity="high", category="cred", port=port, service=service,
+            evidence=f"{rel}: {value}"))
+        host.add_cred(value)
+    # emails -> mailbox usernames for the mail pass
+    emails = set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text))
+    if emails:
+        host.__dict__.setdefault("emails", set()).update(e.lower() for e in emails)
+        utils.log("good", f"{len(emails)} email(s) in {rel}: "
+                          + ", ".join(list(emails)[:6]), indent=3)
 
 
 def _looks_text(raw: bytes) -> bool:
@@ -533,3 +621,6 @@ def _scan_text(host: HostReport, rel: str, body: str, port: int,
     for h in list(hashes)[:5]:
         utils.log("hot", f"hash in {rel}: {h}", indent=3)
         crack_hash(host, h, rel, port, service, pfx)
+    # Prose credentials — onboarding/HR text files ("Default password: ...").
+    if rel.lower().endswith((".txt", ".md", ".csv", ".log", ".rtf", ".text")):
+        _scan_doc_creds(host, rel, body, port, service, pfx)

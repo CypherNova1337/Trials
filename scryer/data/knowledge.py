@@ -390,6 +390,43 @@ def find_windows_creds(text: str):
             yield user.split("\\")[-1], pw
 
 
+# Onboarding / HR document credential idioms: a password (or username scheme)
+# written in prose, e.g. "Default password: Welcome2Corp!", "temporary password
+# is Spring2024!". Looser than the config-file patterns, so scoped to documents.
+_DOC_PW = re.compile(
+    r"(?i)(?:default|temporary|temp|initial|one[- ]?time|your|new|generic|"
+    r"standard)\s+password\s*(?:is|:|=|->|of|will be)?\s*"
+    r"[\"']?([^\s\"'.,;:]{5,40})")
+_DOC_PW2 = re.compile(
+    r"(?i)\bpassword\s*(?:is|:|=)\s*[\"']?([^\s\"'.,;:]{6,40})")
+_DOC_USERSCHEME = re.compile(
+    r"(?i)username\s*(?:is|:|=|format|convention|scheme)?\s*[:=]?\s*"
+    r"([^\n.;]{3,60})")
+
+
+def find_doc_creds(text: str):
+    """Yield (label, value) credentials mined from prose in a document."""
+    if not text:
+        return
+    seen = set()
+    for rx, label in ((_DOC_PW, "Default password"),
+                      (_DOC_PW2, "Password")):
+        for m in rx.finditer(text):
+            val = m.group(1).strip()
+            low = val.lower()
+            if (len(val) < 5 or val in seen or _PLACEHOLDER.match(val)
+                    or low in ("policy", "requirements", "must", "should",
+                               "reset", "change", "expires", "field")):
+                continue
+            seen.add(val)
+            yield label, val
+    m = _DOC_USERSCHEME.search(text)
+    if m:
+        scheme = m.group(1).strip()
+        if scheme and not _PLACEHOLDER.match(scheme):
+            yield "Username scheme", scheme
+
+
 def find_hashes(text: str):
     """Yield distinct password-looking hash tokens found in a credential
     context (not every 32-hex asset fingerprint)."""
