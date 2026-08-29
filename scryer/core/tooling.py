@@ -110,6 +110,8 @@ REGISTRY: List[ExtTool] = [
     ExtTool("binwalk", "firmware / embedded-file carver", apt="binwalk"),
     ExtTool("exiftool", "media metadata reader", apt="libimage-exiftool-perl",
             alts=["exiftool"]),
+    ExtTool("pdftotext", "PDF text extraction (onboarding docs)",
+            apt="poppler-utils"),
     ExtTool("redis-cli", "Redis client", apt="redis-tools"),
     ExtTool("mysql", "MySQL client", apt="default-mysql-client", alts=["mariadb"]),
     ExtTool("psql", "PostgreSQL client", apt="postgresql-client"),
