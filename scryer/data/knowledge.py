@@ -390,18 +390,23 @@ def find_windows_creds(text: str):
             yield user.split("\\")[-1], pw
 
 
-# Onboarding / HR document credential idioms: a password (or username scheme)
-# written in prose, e.g. "Default password: Welcome2Corp!", "temporary password
-# is Spring2024!". Looser than the config-file patterns, so scoped to documents.
-_DOC_PW = re.compile(
-    r"(?i)(?:default|temporary|temp|initial|one[- ]?time|your|new|generic|"
-    r"standard)\s+password\s*(?:is|:|=|->|of|will be)?\s*"
-    r"[\"']?([^\s\"'.,;:]{5,40})")
-_DOC_PW2 = re.compile(
-    r"(?i)\bpassword\s*(?:is|:|=)\s*[\"']?([^\s\"'.,;:]{6,40})")
-_DOC_USERSCHEME = re.compile(
-    r"(?i)username\s*(?:is|:|=|format|convention|scheme)?\s*[:=]?\s*"
-    r"([^\n.;]{3,60})")
+# Onboarding / HR documents write the password in prose ("Temporary password
+# for all new starters: Spring2024!"), so a rigid 'password: X' regex misses it.
+# Two complementary strategies: a broadened structured match (password ... : X),
+# and an entropy match (a password-shaped token near a password keyword).
+_DOC_PW_STRUCT = re.compile(
+    r"(?i)(?:password|passwd|passphrase|passcode)\b[^\n:=]{0,60}?"
+    r"[:=]\s*[\"']?([^\s\"'<>]{5,40})")
+_PW_CTX = re.compile(
+    r"(?i)(?:password|passwd|passphrase|passcode|credential|"
+    r"temporary|initial|default|login\s+details?)")
+# Words that follow 'password' but are never the password itself.
+_PW_STOP = {
+    "policy", "requirements", "must", "should", "will", "shall", "reset",
+    "change", "expires", "expiry", "field", "below", "above", "here", "for",
+    "your", "the", "and", "with", "when", "before", "after", "same",
+    "complexity", "length", "characters", "chars", "minimum", "maximum",
+}
 
 
 def find_doc_creds(text: str):
@@ -409,22 +414,90 @@ def find_doc_creds(text: str):
     if not text:
         return
     seen = set()
-    for rx, label in ((_DOC_PW, "Default password"),
-                      (_DOC_PW2, "Password")):
-        for m in rx.finditer(text):
-            val = m.group(1).strip()
-            low = val.lower()
-            if (len(val) < 5 or val in seen or _PLACEHOLDER.match(val)
-                    or low in ("policy", "requirements", "must", "should",
-                               "reset", "change", "expires", "field")):
-                continue
+
+    def ok(v: str) -> bool:
+        if (not (5 <= len(v) <= 40) or v in seen or v.lower() in _PW_STOP
+                or _PLACEHOLDER.match(v)):
+            return False
+        # a real credential has a digit, a symbol, or mixed case — this rejects
+        # plain prose words ('passwords', 'characters', 'requirements').
+        has_digit = any(c.isdigit() for c in v)
+        has_sym = any(not c.isalnum() for c in v)
+        has_mixed = any(c.islower() for c in v) and any(c.isupper() for c in v)
+        return has_digit or has_sym or has_mixed
+
+    # 1) structured: 'password [maybe words]: VALUE'
+    for m in _DOC_PW_STRUCT.finditer(text):
+        # keep ! and ? (common password chars); strip sentence punctuation
+        val = m.group(1).strip().rstrip(".,;:)")
+        if ok(val):
             seen.add(val)
-            yield label, val
-    m = _DOC_USERSCHEME.search(text)
-    if m:
-        scheme = m.group(1).strip()
-        if scheme and not _PLACEHOLDER.match(scheme):
-            yield "Username scheme", scheme
+            yield "Password", val
+    # 2) entropy: a password-shaped token just after a password keyword.
+    for cm in _PW_CTX.finditer(text):
+        window = text[cm.end(): cm.end() + 90]
+        for tok in re.findall(r"\S{8,40}", window):
+            tok = tok.strip("\"'.,;:()[]<>")
+            if _password_shaped(tok) and ok(tok):
+                seen.add(tok)
+                yield "Password (entropy)", tok
+                break
+
+
+def _password_shaped(t: str) -> bool:
+    """A high-entropy password: 8-40 chars, no spaces, >=3 character classes."""
+    if not (8 <= len(t) <= 40) or " " in t:
+        return False
+    # exclude an actual email (user@host.tld) or a URL, but not a password that
+    # merely contains '@' (Enigm@Corp2024).
+    if re.search(r"@[\w.-]+\.\w{2,}", t) or t.lower().startswith(("http", "www.")):
+        return False
+    classes = sum(bool(re.search(p, t)) for p in
+                  (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
+    return classes >= 3
+
+
+# Words that look like a Capitalised name but aren't, in onboarding/HR prose.
+_NAME_STOP = {
+    "new", "employee", "access", "guide", "all", "your", "email", "the",
+    "questions", "example", "default", "password", "username", "corp", "welcome",
+    "dear", "hello", "please", "note", "temporary", "first", "last", "login",
+    "company", "policy", "account", "user", "name", "team", "department", "it",
+    "human", "resources", "manager", "director", "contact", "support", "help",
+    "monday", "friday", "january", "enigma", "corp", "ltd", "inc", "onboarding",
+    "guidelines", "portal", "system", "network", "server", "please", "thanks",
+    "regards", "sincerely", "best", "kind",
+}
+
+
+def username_variants(text: str):
+    """Derive candidate login names from a document: explicit user tokens
+    (john.smith, jsmith) and permutations of any 'First Last' names it lists.
+    This is what turns 'the naming convention is firstname.lastname, e.g. John
+    Smith' into an actual username list to spray the recovered password over."""
+    users = set()
+    if not text:
+        return users
+    # explicit first.last tokens already in the doc
+    for m in re.finditer(r"\b([a-z]{2,})\.([a-z]{2,})\b", text):
+        f, l = m.group(1), m.group(2)
+        if f in _NAME_STOP or l in _NAME_STOP:
+            continue
+        users.update(_name_perms(f, l))
+    # 'First Last' names -> permutations
+    for m in re.finditer(r"\b([A-Z][a-z]{1,})\s+([A-Z][a-z]{1,})\b", text):
+        f, l = m.group(1).lower(), m.group(2).lower()
+        if f in _NAME_STOP or l in _NAME_STOP:
+            continue
+        users.update(_name_perms(f, l))
+    return users
+
+
+def _name_perms(f: str, l: str):
+    return {
+        f"{f}.{l}", f"{f}{l}", f"{f}_{l}", f"{f[0]}{l}", f"{f[0]}.{l}",
+        f"{f}{l[0]}", f"{l}{f[0]}", f"{l}.{f}", f, l,
+    }
 
 
 def find_hashes(text: str):

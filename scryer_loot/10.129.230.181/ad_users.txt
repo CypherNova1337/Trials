@@ -1,4 +1,0 @@
-ldap
-support
-smith.rosario
-administrator

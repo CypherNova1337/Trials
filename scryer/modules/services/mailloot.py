@@ -25,7 +25,7 @@ from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
 
-_MAX_ATTEMPTS = 80
+_MAX_ATTEMPTS = 200
 _MAX_MSGS = 25
 _COMMON = ["admin", "administrator", "root", "info", "support", "test", "mail"]
 
@@ -82,6 +82,8 @@ def _candidate_users(host: HostReport) -> List[str]:
     for e in emails:
         users.append(e)                       # full address
         users.append(e.split("@", 1)[0])      # local part
+    # usernames derived from names/conventions in looted onboarding docs
+    users += sorted(host.__dict__.get("usernames", set()))
     users += list(host.__dict__.get("ad_users", []))
     # local-parts of any leaked emails in findings
     for f in host.findings:
@@ -95,7 +97,7 @@ def _candidate_users(host: HostReport) -> List[str]:
         if u and u.lower() not in seen:
             seen.add(u.lower())
             out.append(u)
-    return out[:20]
+    return out[:40]
 
 
 def _imap(ip, port, user, pw):
