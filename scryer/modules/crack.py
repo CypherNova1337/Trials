@@ -482,8 +482,14 @@ def _scan_text(host: HostReport, rel: str, body: str, port: int,
     # embedded in code isn't also mis-reported as a flag. (A standalone hex in
     # user.txt/root.txt has no keyword context, so it stays a flag.)
     hashes = set(knowledge.find_hashes(body)) if hasattr(knowledge, "find_hashes") else set()
+    # Bare 32-hex only counts as a flag from an actual flag file (user.txt /
+    # root.txt / flag.txt) or a file whose entire content is one 32-hex token —
+    # otherwise a stray md5 in a config/doc gets mis-reported as a flag.
+    base = os.path.basename(rel).lower()
+    allow_hex = (base in knowledge.FLAG_FILES
+                 or bool(re.fullmatch(r"[0-9a-fA-F]{32}", body.strip())))
     # Flags (skipping anything already identified as a credential hash).
-    for tok in knowledge.find_flags(body):
+    for tok in knowledge.find_flags(body, allow_hex=allow_hex):
         if tok in hashes:
             continue
         bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)

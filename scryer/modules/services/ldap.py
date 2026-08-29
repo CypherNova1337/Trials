@@ -49,6 +49,11 @@ def _anonymous_ldapsearch(host: HostReport, ip: str, port: int):
                   indent=2)
     if base_dn:
         domain = _dn_to_domain(base_dn)
+        # Stash the AD facts so the AD attack chain (adattack) can pick up the
+        # domain / base DN / user list without re-deriving them.
+        host.__dict__["ad_base_dn"] = base_dn
+        if domain:
+            host.__dict__["ad_domain"] = domain
         utils.log("hot", f"anonymous LDAP bind — base DN {base_dn}", indent=2)
         host.add(Finding(
             title="Anonymous LDAP bind allowed",
@@ -64,13 +69,17 @@ def _anonymous_ldapsearch(host: HostReport, ip: str, port: int):
 
 
 def _dump_users(host: HostReport, ip: str, port: int, base_dn: str) -> None:
+    # Also pull description/info — AD admins notoriously stash passwords there
+    # (HTB Support: the `support` user's `info` attribute is the LDAP password).
     rc, out, _ = utils.run(
         ["ldapsearch", "-x", "-H", f"ldap://{ip}:{port}", "-b", base_dn,
-         "(&(objectClass=user)(objectCategory=person))", "sAMAccountName"],
+         "(&(objectClass=user)(objectCategory=person))",
+         "sAMAccountName", "description", "info"],
         timeout=30)
     users = re.findall(r"sAMAccountName:\s*(.+)", out or "")
     users = [u.strip() for u in users if u.strip()]
     if users:
+        host.__dict__["ad_users"] = list(dict.fromkeys(users))
         utils.log("hot", f"anonymous user enumeration: {len(users)} users", indent=2)
         host.add(Finding(
             title="AD users enumerated via anonymous LDAP",
@@ -84,6 +93,30 @@ def _dump_users(host: HostReport, ip: str, port: int, base_dn: str) -> None:
                    "with common/seasonal passwords.",
             severity="info", category="cred", port=port, service="ldap",
             confidence="potential"))
+    # Mine description/info for password-looking values -> spray candidates.
+    for attr in ("description", "info"):
+        for val in re.findall(rf"{attr}:\s*(.+)", out or ""):
+            val = val.strip()
+            if _looks_like_password(val):
+                utils.log("hot", f"possible password in LDAP {attr}: {val}",
+                          indent=2)
+                host.add(Finding(
+                    title=f"Password-shaped value in LDAP {attr}",
+                    detail=f"{val} (an account's {attr} attribute). Spray it "
+                           "across the enumerated users.", severity="high",
+                    category="cred", port=port, service="ldap",
+                    evidence=val))
+                host.add_cred(val)
+
+
+def _looks_like_password(val: str) -> bool:
+    """Heuristic: a credential hiding in a description/info field — reasonably
+    long, no spaces, mixes classes. Excludes prose and GUIDs."""
+    if not (8 <= len(val) <= 64) or " " in val:
+        return False
+    classes = sum(bool(re.search(p, val)) for p in
+                  (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]"))
+    return classes >= 2 and bool(re.search(r"\d", val))
 
 
 def _rootdse_raw(host: HostReport, ip: str, port: int) -> None:

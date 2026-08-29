@@ -875,8 +875,8 @@ def dump_flag_file(host: HostReport, port: int, url: str, body: str,
                    pfx: str = "") -> None:
     """Print the contents of a discovered flag/proof file and record it."""
     content = body.strip()
-    # Prefer an actual flag token if the file wraps it in markup/whitespace.
-    tokens = list(knowledge.find_flags(content))
+    # This is a dedicated flag/proof file, so a bare 32-hex body IS the flag.
+    tokens = list(knowledge.find_flags(content, allow_hex=True))
     display = content if len(content) <= 400 else content[:400] + " …"
 
     bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)

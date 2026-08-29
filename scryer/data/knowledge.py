@@ -136,27 +136,57 @@ FLAG_FILES = {
     "user.flag", "root.flag", "flag.php", "flag.html", "flag.json",
 }
 
-# Recognisable flag formats: HTB{...}/flag{...}/CTF{...} and the bare 32-hex
-# HTB-style hash. Used to spot flags inside any response body too.
-FLAG_RE = re.compile(
-    # name{...} tokens, OR a 32-hex flag. The hex uses hex-only look-around
-    # (not \b) so it still matches when command output glues it to following
-    # text, e.g. "...848528The system cannot find..." (wmiexec type of a file
-    # with no trailing newline).
-    r"(?:[A-Za-z0-9_]{2,20}\{[^}\r\n]{2,120}\}"
-    r"|(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F]))")
+# Known CTF flag prefixes. A `name{...}` token only counts as a flag when its
+# prefix is one of these — otherwise every LaTeX macro (\subsection{title}), RTF
+# control word (\deff0{...}), regex ({2,3}) and code snippet ({code}) inside a
+# scanned binary would be crowned a flag. Extend at runtime with
+# register_flag_prefix() (the CLI --flag-format does this).
+FLAG_PREFIXES = {
+    "flag", "htb", "ctf", "securewv", "thm", "picoctf", "pctf", "key",
+    "cyberwv", "wvctf", "uiuctf", "cvwctf", "vulnlab", "htbctf", "cyber",
+    "sun", "corctf", "dice", "grey", "csa", "nactf", "actf", "wgmy", "bhflag",
+}
 
 
-def find_flags(text: str):
-    """Yield distinct flag-format tokens found in *text*."""
+def register_flag_prefix(prefix: str) -> None:
+    if prefix:
+        FLAG_PREFIXES.add(prefix.strip().rstrip("{").lower())
+
+
+# name{...} with a *known* prefix, and (separately, opt-in) the bare 32-hex
+# HTB-machine flag. The hex uses hex-only look-around (not \b) so it still
+# matches when command output glues it to following text, e.g.
+# "...848528The system cannot find..." (wmiexec type of a file, no newline).
+_PREFIX_FLAG_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]{1,19})\{([^}\r\n]{1,120})\}")
+_HEX32_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32}(?![0-9a-fA-F])")
+# Back-compat alias (some callers imported FLAG_RE directly).
+FLAG_RE = _PREFIX_FLAG_RE
+
+
+def find_flags(text, allow_hex: bool = False):
+    """Yield distinct flag tokens in *text*.
+
+    Only `prefix{...}` tokens with a known CTF prefix are returned. Bare 32-hex
+    (the HTB user.txt/root.txt format) is returned ONLY when allow_hex=True —
+    callers pass that exclusively for flag-file / flag-reading contexts
+    (a shell `type user.txt`, an actual flag.txt), never when scanning arbitrary
+    binaries/configs where 32-hex is almost always an asset/md5 fingerprint.
+    """
     if not text:
         return
     seen = set()
-    for m in FLAG_RE.finditer(text):
-        tok = m.group(0)
-        if tok not in seen:
-            seen.add(tok)
-            yield tok
+    for m in _PREFIX_FLAG_RE.finditer(text):
+        if m.group(1).lower() in FLAG_PREFIXES:
+            tok = m.group(0)
+            if tok not in seen:
+                seen.add(tok)
+                yield tok
+    if allow_hex:
+        for m in _HEX32_RE.finditer(text):
+            tok = m.group(0)
+            if tok not in seen:
+                seen.add(tok)
+                yield tok
 
 # Files worth downloading and parsing for secrets when they return content.
 SECRET_FILES = {
@@ -223,6 +253,35 @@ _CODE_SECRETS = [
 _PLACEHOLDER = re.compile(r"(?i)^(?:your|example|changeme|xxx+|test|password|"
                           r"placeholder|<[^>]+>|\$\{|%[a-z]|null|none|true|false)$")
 
+# Secret-name substrings that are never real credentials (build metadata, not
+# passwords). publicKeyToken is a .NET assembly identity, not a secret.
+_SECRET_NAME_DENY = ("publickeytoken", "processorarchitecture", "versionname",
+                     "keyname", "tokenizer", "csrftoken", "antiforgery")
+# HTML entities and XML/code punctuation fragments that leak from syntax-highlight
+# configs (Notepad++ *.xml) and markup — not credentials.
+_ENTITY = re.compile(r"^&[a-z]+;?$|^&#\d+;?$", re.I)
+
+
+def _junk_secret(value: str) -> bool:
+    """True if a captured credential value is obviously not a real secret."""
+    v = (value or "").strip()
+    if len(v) < 3:
+        return True
+    if _ENTITY.match(v):                       # &quot, &amp, &#39
+        return True
+    if not any(c.isalnum() for c in v):        # pure punctuation: 0], (, ;
+        return True
+    if v.strip("0]}{)(<>;,.\"' ") == "":       # bracket/number noise like "0]"
+        return True
+    if any(ch in v for ch in "<>{}"):          # markup / template fragment
+        return True
+    return False
+
+
+def _denied_secret_name(name: str) -> bool:
+    n = (name or "").lower()
+    return any(bad in n for bad in _SECRET_NAME_DENY)
+
 
 def extract_code_secrets(text: str):
     """Yield (label, value, severity) for credential idioms in source/config."""
@@ -233,6 +292,8 @@ def extract_code_secrets(text: str):
         for m in pattern.finditer(text):
             name, value = m.group(1), m.group(2).strip()
             if not value or _PLACEHOLDER.match(value):
+                continue
+            if _denied_secret_name(name) or _junk_secret(value):
                 continue
             key = (name.lower(), value)
             if key in seen:
@@ -265,7 +326,7 @@ def find_db_creds(text: str):
     seen = set()
     for m in _DBCONN.finditer(text):
         user, pw = m.group(1), m.group(2)
-        if (user, pw) in seen or _PLACEHOLDER.match(pw):
+        if (user, pw) in seen or _PLACEHOLDER.match(pw) or _junk_secret(pw):
             continue
         seen.add((user, pw))
         yield user, pw
@@ -286,7 +347,7 @@ def find_conn_creds(text: str):
     seen = set()
     for pm in _CS_PW.finditer(text):
         pw = pm.group(1)
-        if _PLACEHOLDER.match(pw):
+        if _PLACEHOLDER.match(pw) or _junk_secret(pw):
             continue
         # Pair with the nearest User ID (search a window around the password).
         window = text[max(0, pm.start() - 200): pm.end() + 200]
@@ -320,6 +381,8 @@ def find_windows_creds(text: str):
         for m in pat.finditer(text):
             user, pw = m.group(1), m.group(2)
             if not user or not pw or _PLACEHOLDER.match(pw) or (user, pw) in seen:
+                continue
+            if _junk_secret(pw):
                 continue
             if pw.lower() in ("add", "/add", "get-content", "gc"):
                 continue
