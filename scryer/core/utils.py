@@ -124,6 +124,38 @@ def run(cmd, timeout: int = 60, text: bool = True, env=None):
         return -1, "", str(exc)
 
 
+_sudo_state = None    # None = unknown, True/False = cached result
+
+
+def ensure_sudo() -> bool:
+    """Make sure we can run `sudo -n` without a prompt for the rest of the run.
+
+    Already root -> True. Otherwise, if the sudo timestamp is warm, True. Else,
+    at an interactive TTY, prompt once (`sudo -v`) to warm it and cache the
+    result; in a non-interactive session, return False without blocking. Callers
+    fall back to printing the manual command when this is False.
+    """
+    global _sudo_state
+    if os.geteuid() == 0:
+        return True
+    if _sudo_state is not None:
+        return _sudo_state
+    if subprocess.run(["sudo", "-n", "true"],
+                      capture_output=True).returncode == 0:
+        _sudo_state = True
+        return True
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        _sudo_state = False
+        return False
+    log("info", "sudo is needed (NFS mount / /etc/hosts) — authenticate once:")
+    try:
+        rc = subprocess.run(["sudo", "-v"]).returncode      # interactive prompt
+    except (OSError, KeyboardInterrupt):
+        rc = 1
+    _sudo_state = (rc == 0)
+    return _sudo_state
+
+
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
