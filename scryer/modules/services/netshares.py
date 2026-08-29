@@ -41,9 +41,14 @@ def _loot_export(host: HostReport, ip: str, export: str, port: int) -> None:
         utils.log("dim", f"mount not available — do it manually: "
                          f"sudo mount -t nfs {ip}:{export} /mnt", indent=2)
         return
-    mp = tempfile.mkdtemp(prefix="scryer_nfs_")
     src = f"{ip}:{export}"
-    base = ["mount"] if os.geteuid() == 0 else ["sudo", "-n", "mount"]
+    root = os.geteuid() == 0
+    if not root and not utils.ensure_sudo():
+        utils.log("warn", f"mount needs root and sudo is unavailable — run it "
+                         f"by hand: sudo mount -t nfs {src} /mnt", indent=2)
+        return
+    mp = tempfile.mkdtemp(prefix="scryer_nfs_")
+    base = ["mount"] if root else ["sudo", "-n", "mount"]
     mount_cmd = base + ["-t", "nfs", "-o",
                         "ro,nolock,soft,timeo=30,retry=0,nfsvers=3",
                         src, mp]
@@ -55,11 +60,8 @@ def _loot_export(host: HostReport, ip: str, export: str, port: int) -> None:
             timeout=45)
     if rc != 0:
         detail = (err or out or "").strip()[:100]
-        if "permission denied" in detail.lower() or "not permitted" in detail.lower():
-            utils.log("warn", f"mount needs root — run once: sudo mount -t nfs "
-                             f"{src} /mnt   (sudo cache was cold)", indent=2)
-        else:
-            utils.log("dim", f"could not mount {src} ({detail})", indent=2)
+        utils.log("dim", f"could not mount {src} ({detail}) — try: sudo mount "
+                         f"-t nfs {src} /mnt", indent=2)
         _rmdir(mp)
         return
 

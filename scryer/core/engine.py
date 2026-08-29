@@ -45,6 +45,13 @@ class Engine:
 
         discovery.liveness(host, ip)
 
+        # Warm the sudo timestamp up front when the user opted into privileged
+        # actions (--add-hosts, and the NFS auto-mount that runs mid-scan), so
+        # the one password prompt happens cleanly here instead of interrupting
+        # the scan — and every later `sudo -n` just works.
+        if getattr(self.opts, "add_hosts", False):
+            utils.ensure_sudo()
+
         # Port discovery: prefer the nmap/rustscan pipeline (fast + NSE intel);
         # fall back to the pure-python scanner when nmap is unavailable or the
         # user forced --no-nmap.
