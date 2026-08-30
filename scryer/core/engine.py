@@ -18,7 +18,7 @@ from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
     webexploit, sshprivesc, winattack, web_debug, log4shell, adattack,
-    mailloot)
+    mailloot, roundcube)
 
 
 def _is_ip(name: str) -> bool:
@@ -123,6 +123,11 @@ class Engine:
         # crawl the authed area, and drive sqlmap --os-cmd to a shell + flags.
         webexploit.run(host, self.opts)
 
+        # Roundcube: fingerprint the version, name the CVE that matters, and with
+        # --exploit + a recovered webmail login, run the authenticated RCE
+        # (CVE-2025-49113) and grab the flag.
+        roundcube.run(host, self.opts)
+
         # SSH + sudo/GTFOBins privesc with any recovered credential -> root flag.
         # Runs last so it can use creds looted by the web-exploit phase.
         sshprivesc.run(host, self.opts)
@@ -199,6 +204,7 @@ class Engine:
             if host.creds:
                 webexploit.run(host, self.opts)
                 mailloot.run(host, self.opts)   # guarded against identical re-run
+                roundcube.run(host, self.opts)  # dedups per host:port internally
             if len(host.hostnames) == h0 and len(host.creds) == c0:
                 break
 

@@ -124,6 +124,8 @@ REGISTRY: List[ExtTool] = [
             apt="maven"),
     ExtTool("git", "clone exploit tooling (rogue-jndi, etc.)", apt="git"),
     ExtTool("sshpass", "non-interactive SSH password auth", apt="sshpass"),
+    ExtTool("msfconsole", "Metasploit Framework (CVE auto-exploitation)",
+            apt="metasploit-framework", alts=["msfconsole"]),
     # --- exploit intel / wordlists ---
     ExtTool("searchsploit", "offline Exploit-DB search",
             apt="exploitdb", essential=True),
