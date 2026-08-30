@@ -126,6 +126,8 @@ REGISTRY: List[ExtTool] = [
     ExtTool("sshpass", "non-interactive SSH password auth", apt="sshpass"),
     ExtTool("msfconsole", "Metasploit Framework (CVE auto-exploitation)",
             apt="metasploit-framework", alts=["msfconsole"]),
+    ExtTool("php", "PHP CLI (runs PHP-based exploit PoCs)", apt="php-cli",
+            alts=["php"]),
     # --- exploit intel / wordlists ---
     ExtTool("searchsploit", "offline Exploit-DB search",
             apt="exploitdb", essential=True),
