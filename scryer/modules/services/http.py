@@ -75,6 +75,7 @@ class _LinkFormParser(HTMLParser):
         self.login_method = "post"
         self.login_user_field = ""
         self.login_pass_field = ""
+        self.login_hidden = {}      # hidden inputs (CSRF token etc.) to replay
         self._cur_action = ""
         self._cur_method = "post"
         self._cur_user = ""
@@ -104,6 +105,10 @@ class _LinkFormParser(HTMLParser):
                 # If the password field was already seen, backfill the user field.
                 if self._cur_pass and not self.login_user_field:
                     self.login_user_field = name
+            elif itype == "hidden" and name:
+                # CSRF tokens / framework fields the server requires on POST
+                # (Roundcube _token, Laravel _token, __RequestVerificationToken).
+                self.login_hidden[name] = a.get("value", "")
         elif tag == "script" and a.get("src"):
             self.scripts.append(a["src"])
 
