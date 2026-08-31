@@ -58,7 +58,13 @@ def run(host: HostReport, opts) -> None:
             continue
         seen.add(key)
         _report(host, base, hoststr, version)
-        if getattr(opts, "exploit", False) and _vulnerable(version):
+        # Attempt the exploit when the version is vulnerable OR unknown — the
+        # native P7M RCE is authenticated and cheap and self-confirms by actually
+        # getting code exec, so an attempt against a version-hidden instance costs
+        # little and never falsely claims a hit. Only a KNOWN-patched build
+        # (>= 2.9.9) is skipped.
+        if getattr(opts, "exploit", False) and (_vulnerable(version)
+                                                 or version == "unknown"):
             _exploit(host, base, hoststr, version)
 
 
