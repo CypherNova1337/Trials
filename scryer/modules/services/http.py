@@ -656,12 +656,16 @@ def _harvest_usernames(host: HostReport, port: int, base: str, vhost: str,
              and u not in _NAME_JUNK}
     if not found:
         return
-    new = found - host.__dict__.setdefault("usernames", set())
-    host.__dict__["usernames"].update(found)
+    # Keep web-harvested names in a SEPARATE, lower-confidence bucket — never mix
+    # them into the doc-derived `usernames` set. Marketing copy ('A Dedicated
+    # Assistance Team') can slip through the role anchor, and if that noise sorts
+    # ahead of a real login it throttles Dovecot before the valid user is tried.
+    new = found - host.__dict__.setdefault("web_usernames", set())
+    host.__dict__["web_usernames"].update(found)
     if new:
         sample = ", ".join(sorted(new)[:8])
-        utils.log("good", f"{pfx}{len(new)} username(s) from staff/team pages "
-                          f"-> reuse spray: {sample}", indent=1)
+        utils.log("dim", f"{pfx}{len(new)} name candidate(s) from staff/team pages "
+                         f"(low-confidence spray tail): {sample}", indent=1)
 
 
 def _visible_text(html: str) -> str:
