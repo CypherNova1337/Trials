@@ -28,6 +28,7 @@ from ...core.report import HostReport, Finding
 from ...data import knowledge
 
 _MAX_ATTEMPTS = 350
+_GENTLE_BROAD = 25      # broad-spray cap unless --mail-spray (avoid lockouts)
 _MAX_MSGS = 25
 _TIMEOUT = 6            # per mail connection — bounds the whole pass
 _COMMON = ["admin", "administrator", "root", "info", "support", "test", "mail"]
@@ -43,6 +44,14 @@ def run(host: HostReport, opts) -> None:
     pws = list(dict.fromkeys(host.creds))
     if not (confident or broad) or not pws:
         return
+    # The broad first-name spray is loud: hundreds of failed IMAP auths per run
+    # trip Dovecot's auth-penalty / fail2ban and then lock out even the VALID
+    # login. So by default we only try the accounts the box actually named (plus
+    # colleagues surfaced from an opened mailbox); the full spray is opt-in via
+    # --mail-spray. A gentle spray keeps the valid credential working.
+    full = getattr(opts, "mail_spray", False) or os.environ.get("SCRYER_MAIL_SPRAY")
+    if not full:
+        broad = broad[:_GENTLE_BROAD]
     # Skip if we already probed this exact user/password set (the convergence
     # loop may call us again — don't re-run identical work).
     sig = (frozenset(u.lower() for u in confident + broad), frozenset(pws))
@@ -52,8 +61,10 @@ def run(host: HostReport, opts) -> None:
 
     ip = host.resolved_ip or host.target
     utils.section(f"MAIL {ip}")
+    tail = (f" then a {len(broad)}-name reuse spray" if broad else "")
+    tail += "" if full else "  (gentle — --mail-spray for the full list)"
     utils.log("info", f"replaying {len(pws)} password(s): {len(confident)} known "
-                      f"account(s) then a {len(broad)}-name reuse spray", indent=1)
+                      f"account(s){tail}", indent=1)
 
     def probe(user):
         for pw in pws:
@@ -116,7 +127,18 @@ def run(host: HostReport, opts) -> None:
         if len(sprayed) == before:
             break
     if not hits:
-        utils.log("dim", "no mailbox opened with the known credentials", indent=1)
+        utils.log("warn", "no mailbox opened with the known credentials", indent=1)
+        # A known-good login failing usually means the mail server is throttling
+        # this IP after repeated attempts (Dovecot auth-penalty / fail2ban), not
+        # that the password is wrong. Say so and give a one-shot manual check.
+        u0 = confident[0] if confident else "kevin"
+        p0 = pws[0]
+        utils.log("dim", "if a credential you KNOW is valid didn't open, the mail "
+                         "server is likely rate-limiting/ban this IP after earlier "
+                         "sprays — wait ~15-30 min (or reset the box), then verify "
+                         "one login by hand:", indent=1)
+        utils.log("dim", f"  python3 -c 'import imaplib; m=imaplib.IMAP4_SSL(\"{ip}\""
+                         f",993); print(m.login(\"{u0}\",\"{p0}\"))'", indent=1)
 
 
 # --------------------------------------------------------------------------
