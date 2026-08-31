@@ -731,8 +731,12 @@ def _portal_logins(host: HostReport) -> List[str]:
                 add(f"{m[0]}:{m[1]}")
 
     users = _candidate_users(host)
-    for pw in list(dict.fromkeys(host.creds))[:12]:
-        for u in users[:12]:
+    creds = list(dict.fromkeys(host.creds))[:12]
+    # User-OUTER so each candidate is tried with EVERY recovered password before
+    # moving on — a password-outer loop buries the real portal password (the 2nd
+    # cred, from a provisioning email) past the caller's attempt cap.
+    for u in users[:12]:
+        for pw in creds:
             add(f"{u}:{pw}")
     return out[:60]
 
