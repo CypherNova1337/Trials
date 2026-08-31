@@ -67,7 +67,11 @@ def _detect(scheme: str, vhost: str, port: int) -> Tuple[Optional[str], str]:
         body = _get(base + sub, vhost)
         if body and _is_opensta(body):
             return base, _version(base, vhost, body)
-    # common sub-directory install
+    # Sub-directory install — but only if this vhost isn't a catch-all that
+    # returns 200 for any path (that's what made /openstamanager false-positive
+    # on the Roundcube host). Baseline a random path first.
+    if _is_catch_all(base, vhost):
+        return None, ""
     for sub in ("/openstamanager", "/gestionale", "/osm"):
         body = _get(base + sub + "/", vhost)
         if body and _is_opensta(body):
@@ -75,12 +79,23 @@ def _detect(scheme: str, vhost: str, port: int) -> Tuple[Optional[str], str]:
     return None, ""
 
 
+def _is_catch_all(base: str, vhost: str) -> bool:
+    probe = _get(base + "/scryer_" + os.urandom(4).hex() + "/", vhost)
+    return bool(probe) and len(probe) > 200
+
+
 def _is_opensta(body: str) -> bool:
+    """Require an unambiguous OpenSTAManager marker. The weak 'osm'/username
+    heuristics matched unrelated login pages, so they're gone."""
     low = body.lower()
-    return ("openstamanager" in low
-            or "open sta manager" in low
-            or ("id_module" in low and "actions.php" in low)
-            or 'name="username"' in low and "osm" in low)
+    if "openstamanager" in low or "open sta manager" in low:
+        return True
+    if "devcode-it" in low and "actions.php" in low:
+        return True
+    # its API/app pages carry both the module router and its own asset paths
+    return ("id_module=" in low and "actions.php" in low
+            and ("/assets/" in low or "ajax_complete.php" in low
+                 or "primanota" in low))
 
 
 def _version(base: str, vhost: str, root: str) -> str:
@@ -365,15 +380,30 @@ def _portal_logins(host: HostReport) -> List[str]:
 
     def add(pair: str):
         pair = pair.strip()
-        if pair and ":" in pair and pair.lower() not in seen:
-            seen.add(pair.lower())
-            out.append(pair)
+        if not pair or ":" not in pair or pair.lower() in seen:
+            return
+        u, _, p = pair.partition(":")
+        # Never mistake an SSH host key / hash fingerprint (0c:4b:d2:…) or a
+        # MAC-style value for a login: reject when the password half is itself
+        # colon-separated hex pairs, or is pure long hex.
+        if re.fullmatch(r"(?:[0-9a-fA-F]{2}:)+[0-9a-fA-F]{2}", p) or \
+                (len(p) >= 16 and re.fullmatch(r"[0-9a-fA-F]+", p)):
+            return
+        if not u or not p:
+            return
+        seen.add(pair.lower())
+        out.append(pair)
 
-    # explicit user:pass surfaced elsewhere (mailbox logins, doc creds)
+    # explicit user:pass only from credential-bearing findings (a mailbox login,
+    # a doc/portal credential) — NOT from arbitrary finding text, which sweeps
+    # up SSH host keys and other colon-separated noise.
     for f in host.findings:
-        blob = f"{f.title} {f.detail or ''} {f.evidence or ''}"
-        for m in re.findall(r"([A-Za-z0-9._%+-]{2,40}):([^\s,;'\"]{3,40})", blob):
-            add(f"{m[0]}:{m[1]}")
+        if f.category != "cred":
+            continue
+        for src in (f.evidence or "", f.detail or ""):
+            for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
+                                r"([^\s,;'\"]{3,40})", src):
+                add(f"{m[0]}:{m[1]}")
 
     users = _candidate_users(host)
     for pw in list(dict.fromkeys(host.creds))[:12]:
