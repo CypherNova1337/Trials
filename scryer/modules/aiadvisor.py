@@ -1,13 +1,24 @@
-"""Optional local-LLM advisor — the reasoning layer on top of the rules brain.
+"""LLM reasoning layer — advisor + agent brain, local or via an API key.
 
-When the operator wants a second opinion on the fuzzy calls ("which of these
-creds is real?", "what's the actual foothold here?"), scryer can hand the recon
-summary to a model running locally under Ollama and print its suggestion. This
-is strictly optional and offline: no API key, no cost, no data leaves the box.
-If Ollama isn't running, it prints a one-line hint and gets out of the way.
+scryer can hand the recon state to a model and get the next exploitation move.
+Two backends:
 
-Enable with --ai (or SCRYER_AI=1). Model comes from --ai-model / $SCRYER_AI_MODEL,
-default llama3.1. Endpoint from $SCRYER_OLLAMA (default http://localhost:11434).
+  * Ollama (local, default): no API key, no cost, nothing leaves the box.
+  * Any OpenAI-compatible chat API (DeepSeek, OpenAI, OpenRouter, Groq, a
+    self-hosted endpoint): set an API key and scryer POSTs to /chat/completions.
+
+Selection is automatic from the environment, or forced with --ai-provider:
+
+    DeepSeek : export DEEPSEEK_API_KEY=...              (model deepseek-chat)
+    OpenAI   : export OPENAI_API_KEY=...                (model gpt-4o-mini)
+    Custom   : export SCRYER_AI_URL=https://host/v1/chat/completions \\
+               SCRYER_AI_KEY=... SCRYER_AI_MODEL=...
+    Ollama   : (nothing) — falls back to http://localhost:11434
+
+Model override: --ai-model / $SCRYER_AI_MODEL. NOTE: with an API backend the
+recon summary (target, ports, creds, findings) is sent to that third party —
+your call on an authorised engagement. API keys are read from the env and never
+logged.
 """
 
 from __future__ import annotations
@@ -17,55 +28,103 @@ import os
 import socket
 import urllib.error
 import urllib.request
-from typing import List
+from typing import List, Optional
 
 from ..core import utils
 from ..core.report import HostReport
 
 _DEFAULT_ENDPOINT = "http://localhost:11434"
-_DEFAULT_MODEL = "llama3.1"
+_DEFAULT_OLLAMA_MODEL = "llama3.1"
+
+# provider -> (default chat-completions URL, default model, provider-specific
+# key env var). SCRYER_AI_KEY is a generic fallback used only when the provider
+# is chosen explicitly, so it never hijacks auto-detection of a custom endpoint.
+_PROVIDERS = {
+    "deepseek": ("https://api.deepseek.com/v1/chat/completions", "deepseek-chat",
+                 "DEEPSEEK_API_KEY"),
+    "openai": ("https://api.openai.com/v1/chat/completions", "gpt-4o-mini",
+               "OPENAI_API_KEY"),
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions",
+                   "deepseek/deepseek-chat", "OPENROUTER_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1/chat/completions",
+             "llama-3.3-70b-versatile", "GROQ_API_KEY"),
+}
 
 
-def resolve(args):
-    """Return (endpoint, model) for the local LLM, or None if unreachable."""
-    endpoint = os.environ.get("SCRYER_OLLAMA", _DEFAULT_ENDPOINT).rstrip("/")
-    model = (getattr(args, "ai_model", None) or os.environ.get("SCRYER_AI_MODEL")
-             or _DEFAULT_MODEL)
-    return (endpoint, model) if _reachable(endpoint) else None
+def resolve(args) -> Optional[dict]:
+    """Return the LLM backend config, or None if none is usable.
+
+    cfg = {kind: 'api'|'ollama', name, url, model, key?}. Order: an explicitly
+    chosen/keyed API provider, a custom endpoint, then a reachable local Ollama.
+    """
+    prov = (getattr(args, "ai_provider", None)
+            or os.environ.get("SCRYER_AI_PROVIDER") or "").strip().lower()
+    model = getattr(args, "ai_model", None) or os.environ.get("SCRYER_AI_MODEL")
+
+    # explicit or key-detected OpenAI-compatible provider
+    for name, (url, dmodel, keyvar) in _PROVIDERS.items():
+        specific = os.environ.get(keyvar)
+        if prov == name:
+            keyed = specific or os.environ.get("SCRYER_AI_KEY")
+        elif not prov and specific:
+            keyed = specific        # auto-detect only on the provider's own key
+        else:
+            continue
+        if keyed:
+            return {"kind": "api", "name": name,
+                    "url": os.environ.get("SCRYER_AI_URL") or url,
+                    "model": model or dmodel, "key": keyed}
+    # a fully custom endpoint
+    if prov == "custom" or (not prov and os.environ.get("SCRYER_AI_URL")
+                            and os.environ.get("SCRYER_AI_KEY")):
+        url = os.environ.get("SCRYER_AI_URL")
+        key = os.environ.get("SCRYER_AI_KEY")
+        if url:
+            return {"kind": "api", "name": "custom", "url": url,
+                    "model": model or "default", "key": key or ""}
+    # local Ollama fallback
+    if not prov or prov == "ollama":
+        endpoint = os.environ.get("SCRYER_OLLAMA", _DEFAULT_ENDPOINT).rstrip("/")
+        if _reachable(endpoint):
+            return {"kind": "ollama", "name": "ollama", "url": endpoint,
+                    "model": model or _DEFAULT_OLLAMA_MODEL}
+    return None
 
 
 def ask(args, prompt: str) -> str:
-    """One-shot query to the resolved local model. '' on any failure."""
-    got = resolve(args)
-    return _generate(got[0], got[1], prompt) if got else ""
+    """One-shot query to the resolved backend. '' on any failure."""
+    cfg = resolve(args)
+    return _generate(cfg, prompt) if cfg else ""
 
 
 def advise(host: HostReport, args) -> None:
     if not (getattr(args, "ai", False) or os.environ.get("SCRYER_AI")):
         return
-    endpoint = os.environ.get("SCRYER_OLLAMA", _DEFAULT_ENDPOINT).rstrip("/")
-    model = (getattr(args, "ai_model", None) or os.environ.get("SCRYER_AI_MODEL")
-             or _DEFAULT_MODEL)
-
-    if not _reachable(endpoint):
-        utils.log("dim", f"--ai: no Ollama at {endpoint} — start it "
-                         "(`ollama serve` + `ollama pull llama3.1`) or set "
-                         "$SCRYER_OLLAMA; skipping the AI advisor")
+    cfg = resolve(args)
+    if not cfg:
+        utils.log("dim", "--ai: no LLM backend — set DEEPSEEK_API_KEY / "
+                         "OPENAI_API_KEY (or SCRYER_AI_URL+SCRYER_AI_KEY), or run "
+                         "Ollama locally; skipping the AI advisor")
         return
 
-    prompt = _build_prompt(host)
-    utils.log("info", f"asking the local model ({model}) for the next move…")
-    answer = _generate(endpoint, model, prompt)
+    where = ("remote API" if cfg["kind"] == "api" else "local")
+    utils.log("info", f"asking {cfg['name']} ({cfg['model']}, {where}) for the "
+                      "next move…")
+    if cfg["kind"] == "api":
+        utils.log("dim", f"  (sending the recon summary to {cfg['name']} — a "
+                         "third-party API)")
+    answer = _generate(cfg, _build_prompt(host))
     if not answer:
-        utils.log("dim", "--ai: the local model returned nothing (is the model "
-                         f"pulled? `ollama pull {model}`)")
+        utils.log("dim", f"--ai: {cfg['name']} returned nothing (check the key / "
+                         "model / connectivity)")
         return
 
-    print("\n" + utils.c("┌─[ AI ADVISOR  (local model: " + model + ") ]"
-                        + "─" * 18, utils.C.MAGENTA, utils.C.BOLD))
+    label = f"{cfg['name']}: {cfg['model']}"
+    print("\n" + utils.c(f"┌─[ AI ADVISOR  ({label}) ]" + "─" * 16,
+                        utils.C.MAGENTA, utils.C.BOLD))
     for line in answer.strip().splitlines():
         print("  " + line)
-    print("  " + utils.c("(local-model suggestion — verify before you run it)",
+    print("  " + utils.c("(model suggestion — verify before you run it)",
                          utils.C.GREY))
     print()
 
@@ -104,6 +163,68 @@ def _build_prompt(host: HostReport) -> str:
         "\n\nWhat is the most promising next step, and exactly how?")
 
 
+# --------------------------------------------------------------------------
+def _generate(cfg: dict, prompt: str) -> str:
+    if cfg["kind"] == "ollama":
+        return _ollama(cfg["url"], cfg["model"], prompt)
+    return _api_chat(cfg, prompt)
+
+
+def _ollama(endpoint: str, model: str, prompt: str) -> str:
+    payload = json.dumps({
+        "model": model, "prompt": prompt, "stream": False,
+        "options": {"temperature": 0.2}}).encode()
+    req = urllib.request.Request(
+        f"{endpoint}/api/generate", data=payload,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            return (data.get("response") or "").strip()
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        utils.log("dim", f"--ai: Ollama request failed ({str(exc)[:60]})")
+        return ""
+
+
+def _api_chat(cfg: dict, prompt: str) -> str:
+    """OpenAI-compatible /chat/completions call (DeepSeek, OpenAI, …)."""
+    payload = json.dumps({
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": "You are an expert penetration "
+             "tester helping on an authorised lab machine. Be concise and "
+             "give exact commands."},
+            {"role": "user", "content": prompt}],
+        "temperature": 0.2, "stream": False}).encode()
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("key"):
+        headers["Authorization"] = f"Bearer {cfg['key']}"
+    req = urllib.request.Request(cfg["url"], data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        choices = data.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            return (msg.get("content") or "").strip()
+        err = (data.get("error") or {}).get("message", "")
+        if err:
+            utils.log("dim", f"--ai: {cfg['name']} API said: {err[:120]}")
+        return ""
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read(400).decode("utf-8", "replace")
+        except Exception:
+            pass
+        utils.log("dim", f"--ai: {cfg['name']} API error {exc.code} "
+                         f"{body[:120]}")
+        return ""
+    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
+        utils.log("dim", f"--ai: {cfg['name']} request failed ({str(exc)[:60]})")
+        return ""
+
+
 def _reachable(endpoint: str) -> bool:
     try:
         host, port = _split(endpoint)
@@ -117,19 +238,3 @@ def _split(endpoint: str):
     hostport = endpoint.split("://", 1)[-1]
     host, _, port = hostport.partition(":")
     return host or "localhost", int(port or 11434)
-
-
-def _generate(endpoint: str, model: str, prompt: str) -> str:
-    payload = json.dumps({
-        "model": model, "prompt": prompt, "stream": False,
-        "options": {"temperature": 0.2}}).encode()
-    req = urllib.request.Request(
-        f"{endpoint}/api/generate", data=payload,
-        headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-            return data.get("response", "").strip()
-    except (urllib.error.URLError, ValueError, TimeoutError, OSError) as exc:
-        utils.log("dim", f"--ai: Ollama request failed ({str(exc)[:60]})")
-        return ""

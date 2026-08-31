@@ -82,9 +82,10 @@ def run(host: HostReport, opts) -> None:
     if not getattr(opts, "agent", False):
         return
     if not aiadvisor.resolve(opts):
-        utils.log("warn", "--agent needs a local LLM (Ollama) to drive the loop "
-                          "— start it (`ollama serve`) or set $SCRYER_OLLAMA; "
-                          "the ranked ATTACK PLAN above is the manual version")
+        utils.log("warn", "--agent needs an LLM to drive the loop — run Ollama "
+                          "locally, or set an API key (DEEPSEEK_API_KEY / "
+                          "OPENAI_API_KEY, or SCRYER_AI_URL+SCRYER_AI_KEY); the "
+                          "ranked ATTACK PLAN above is the manual version")
         return
 
     auto = getattr(opts, "agent_auto", False)

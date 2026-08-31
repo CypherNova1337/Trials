@@ -80,15 +80,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="with --connect: raw relay only (disable the "
                           "arithmetic/PoW auto-solver)")
 
-    ai = p.add_argument_group("agent / AI advisor (optional, offline)")
+    ai = p.add_argument_group("agent / AI advisor (Ollama or an API key)")
     ai.add_argument("--ai", action="store_true",
-                    help="ask a locally-hosted LLM (Ollama) to read the recon "
-                         "state and recommend the next exploitation step. No API "
-                         "key, no cost — needs Ollama running locally. Also "
-                         "enabled by SCRYER_AI=1.")
+                    help="ask an LLM to read the recon state and recommend the "
+                         "next exploitation step. Uses a local Ollama by default; "
+                         "or set an API key (DEEPSEEK_API_KEY / OPENAI_API_KEY, "
+                         "or SCRYER_AI_URL+SCRYER_AI_KEY). Also enabled by "
+                         "SCRYER_AI=1.")
+    ai.add_argument("--ai-provider", metavar="NAME", default=None,
+                    choices=["ollama", "deepseek", "openai", "openrouter",
+                             "groq", "custom"],
+                    help="force the LLM backend (default: auto-detect from the "
+                         "environment). One of: ollama, deepseek, openai, "
+                         "openrouter, groq, custom.")
     ai.add_argument("--ai-model", metavar="NAME", default=None,
-                    help="Ollama model for --ai (default: $SCRYER_AI_MODEL or "
-                         "llama3.1)")
+                    help="model name (default: the provider's default, or "
+                         "$SCRYER_AI_MODEL) — e.g. deepseek-chat, gpt-4o-mini")
     ai.add_argument("--agent", action="store_true",
                     help="autonomous execution loop: the local LLM proposes the "
                          "next command, scryer safety-checks and runs it, scans "

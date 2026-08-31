@@ -18,7 +18,7 @@ from ..modules.services import (
     http, tls, dns, smb, auth_svcs, datastores, ldap, vhost,
     snmp, mail, netshares, sqldb, remote, webcrawl, params, s3exploit,
     webexploit, sshprivesc, winattack, web_debug, log4shell, adattack,
-    mailloot, roundcube)
+    mailloot, roundcube, openstamanager)
 
 
 def _is_ip(name: str) -> bool:
@@ -128,6 +128,13 @@ class Engine:
         # (CVE-2025-49113) and grab the flag.
         roundcube.run(host, self.opts)
 
+        # OpenSTAManager: fingerprint the version, name the authenticated SQLi
+        # cluster (CVE-2026-24418/24419, CVE-2025-69214), and with --exploit + a
+        # recovered portal login, log in and run the error-based extraction to
+        # dump users/flag. Runs after mail/roundcube so the reuse spray has
+        # already recovered the second mailbox's portal credentials.
+        openstamanager.run(host, self.opts)
+
         # SSH + sudo/GTFOBins privesc with any recovered credential -> root flag.
         # Runs last so it can use creds looted by the web-exploit phase.
         sshprivesc.run(host, self.opts)
@@ -205,6 +212,7 @@ class Engine:
                 webexploit.run(host, self.opts)
                 mailloot.run(host, self.opts)   # guarded against identical re-run
                 roundcube.run(host, self.opts)  # dedups per host:port internally
+                openstamanager.run(host, self.opts)  # dedups per host:port
             if len(host.hostnames) == h0 and len(host.creds) == c0:
                 break
 

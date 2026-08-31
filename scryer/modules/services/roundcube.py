@@ -288,7 +288,10 @@ def _grab_flags(host: HostReport, blob: str, base: str) -> bool:
 # --------------------------------------------------------------------------
 def _rce_vulnerable(version: str) -> bool:
     if version == "unknown":
-        return True          # Roundcube present, version hidden -> assume + verify
+        # Do NOT assume vulnerable — a patched build (e.g. Roundcube 1.6.16 on
+        # HTB Enigma) that hides its version would send us chasing a dead-end RCE
+        # for no reason. Only auto-exploit a CONFIRMED-vulnerable version.
+        return False
     parts = [int(x) for x in re.findall(r"\d+", version)[:3]]
     while len(parts) < 3:
         parts.append(0)
