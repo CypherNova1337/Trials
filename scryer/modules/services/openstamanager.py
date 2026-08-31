@@ -48,24 +48,41 @@ _FIXED = (2, 9, 9)
 
 
 def run(host: HostReport, opts) -> None:
-    seen = host.__dict__.setdefault("_opensta_done", set())
+    # Detection/report is cached per host:port; exploitation is NOT permanently
+    # cached — the portal credentials often arrive AFTER the first pass (a second
+    # mailbox opened by the convergence loop), so we must retry the exploit when
+    # a new set of logins becomes available.
+    detected = host.__dict__.setdefault("_opensta_detected", {})
+    pwned = host.__dict__.setdefault("_opensta_pwned", set())
+    tried = host.__dict__.setdefault("_opensta_tried", {})
     for scheme, hoststr, port in _web_targets(host):
         key = (hoststr, port)
-        if key in seen:
+        if key in detected:
+            base, version = detected[key]
+        else:
+            base, version = _detect(scheme, hoststr, port)
+            if base is None:
+                continue
+            detected[key] = (base, version)
+            _report(host, base, hoststr, version)
+        if key in pwned:
             continue
-        base, version = _detect(scheme, hoststr, port)
-        if base is None:
-            continue
-        seen.add(key)
-        _report(host, base, hoststr, version)
         # Attempt the exploit when the version is vulnerable OR unknown — the
         # native P7M RCE is authenticated and cheap and self-confirms by actually
         # getting code exec, so an attempt against a version-hidden instance costs
         # little and never falsely claims a hit. Only a KNOWN-patched build
         # (>= 2.9.9) is skipped.
-        if getattr(opts, "exploit", False) and (_vulnerable(version)
-                                                 or version == "unknown"):
-            _exploit(host, base, hoststr, version)
+        if not (getattr(opts, "exploit", False) and (_vulnerable(version)
+                                                      or version == "unknown")):
+            continue
+        # Only (re)run when the available logins changed since the last attempt,
+        # so convergence re-invocations don't repeat identical, failed work.
+        logins = frozenset(_portal_logins(host))
+        if not logins or tried.get(key) == logins:
+            continue
+        tried[key] = logins
+        if _exploit(host, base, hoststr, version):
+            pwned.add(key)
 
 
 # --------------------------------------------------------------------------
