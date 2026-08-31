@@ -501,6 +501,21 @@ def _scan_doc_creds(host: HostReport, rel: str, text: str, port: int,
         host.__dict__.setdefault("emails", set()).update(e.lower() for e in emails)
         utils.log("good", f"{len(emails)} email(s) in {rel}: "
                           + ", ".join(list(emails)[:6]), indent=3)
+    # An EXPLICIT login in the doc ("Username: kevin", "Login: kevin") is the
+    # single most likely mailbox/SSH account — record it as a PRIMARY user so the
+    # mail pass tries it FIRST, before the derived variants (and before any
+    # throttling). Burying it in the variant pile is what made kevin's mailbox
+    # get throttled out on a real run.
+    primaries = []
+    for m in re.finditer(r"(?im)\b(?:user(?:name)?|login|account|logon)\s*[:=]\s*"
+                         r"([A-Za-z][A-Za-z0-9._-]{1,31})", text):
+        val = m.group(1).strip().lower()
+        if val not in ("name", "id", "password", "the", "your"):
+            primaries.append(val)
+    if primaries:
+        host.__dict__.setdefault("primary_users", []).extend(primaries)
+        utils.log("hot", f"explicit login(s) in {rel}: "
+                         + ", ".join(dict.fromkeys(primaries)), indent=3)
     # names + conventions -> a real username list to spray creds over
     users = knowledge.username_variants(text)
     if users:

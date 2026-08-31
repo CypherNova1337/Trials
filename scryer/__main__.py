@@ -56,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--params", action="store_true",
                      help="run paramvoid parameter discovery on web endpoints "
                           "(implied by --web-brute)")
+    web.add_argument("--mail-spray", action="store_true",
+                     help="replay recovered passwords across the full first-name "
+                          "list over IMAP/POP3 (loud — can trip Dovecot/fail2ban "
+                          "rate-limiting). Off by default: only the accounts the "
+                          "box named, plus colleagues found in an opened mailbox, "
+                          "are tried")
 
     art = p.add_argument_group("offline artifacts (Jeopardy CTF)")
     art.add_argument("--file", metavar="PATH",

