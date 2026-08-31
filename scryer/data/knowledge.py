@@ -409,6 +409,34 @@ _PW_STOP = {
 }
 
 
+def find_login_pairs(text: str):
+    """Yield (username, password) pairs stated together in prose, e.g.
+    'Username: admin  Password: Ne3s4rtars78s'. Each username is paired with the
+    nearest password token, so a portal login recovered from an email arrives as
+    an exact credential — not a bare password that a cartesian spray buries."""
+    if not text:
+        return []
+    users = [(m.start(), m.group(1)) for m in re.finditer(
+        r"(?i)\b(?:user(?:name)?|login|account|user id|userid)\s*[:=]\s*"
+        r"([A-Za-z0-9._%+\-\\]{2,64})", text)]
+    passes = [(m.start(), m.group(1)) for m in re.finditer(
+        r"(?i)\b(?:pass(?:word|wd|code|phrase)?|pwd)\s*[:=]\s*"
+        r"([^\s,;<>\"']{3,64})", text)]
+    out, seen = [], set()
+    for pu, u in users:
+        if u.lower() in ("name", "id", "the", "your"):
+            continue
+        cand = sorted((abs(pp - pu), pp, p) for pp, p in passes)
+        if not cand:
+            continue
+        pw = cand[0][2]
+        key = f"{u.lower()}:{pw}"
+        if key not in seen:
+            seen.add(key)
+            out.append((u, pw))
+    return out
+
+
 def find_doc_creds(text: str):
     """Yield (label, value) credentials mined from prose in a document."""
     if not text:

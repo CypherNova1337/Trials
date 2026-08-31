@@ -464,6 +464,19 @@ def _mine(host: HostReport, user: str, body: str, port: int) -> None:
         host.add_cred(pw)
     for _lbl, pw in knowledge.find_doc_creds(body):     # prose creds in mail
         host.add_cred(pw)
+    # Explicit "Username: admin  Password: X" pairs (a provisioning email is the
+    # classic source of a downstream portal login) -> record the EXACT pair so
+    # the web/portal exploiters try admin:X directly, not a cartesian guess that
+    # a password-outer spray would bury past its attempt cap.
+    for pu, pp in knowledge.find_login_pairs(body):
+        host.add_cred(pp)
+        host.__dict__.setdefault("usernames", set()).add(pu.lower())
+        host.add(Finding(
+            title=f"Portal credential in {user}'s mail: {pu}",
+            detail=f"{pu}:{pp} (from {user}'s mailbox). Reuse on the portal/app "
+                   "the mail provisions.", severity="high", category="cred",
+            port=port, service="mail", evidence=f"{pu}:{pp}"))
+        utils.log("hot", f"portal login in mail: {pu}:{pp}", indent=2)
     # OTHER employees named in the mail (From/To/CC, signatures, "contact X")
     # are the real pivot on a reuse box: add them as HIGH-confidence spray
     # targets so the convergence loop replays the password into their mailbox.
