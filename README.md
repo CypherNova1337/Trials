@@ -1,5 +1,111 @@
 # scryer
 
+> ## 🗄️ This project is archived
+>
+> **Status: archived / no longer maintained — as of September 2026.**
+>
+> scryer still runs, and everything below still describes what it does. But I've
+> taken it as far as I can, and I'd rather say that plainly than leave it sitting
+> here looking like something that's still being worked on.
+>
+> The repository is read-only. Issues and pull requests are closed. Fork it,
+> strip it for parts, or lift whole modules into your own tooling — the license
+> below still applies and nothing here needs my permission.
+
+---
+
+## Why I'm stopping
+
+The honest version, because a stale repo with no explanation helps nobody.
+
+**The easy 80% is done. The remaining 20% isn't a coding problem.**
+
+scryer's enumeration half works, and it works well. Resolving a host, scanning
+it, actively fingerprinting what's listening, pulling apart web responses,
+extracting secrets from leaked config, brute-forcing vhosts, walking SMB and
+LDAP and SNMP, folding it all into one confidence-scored report — that's a large
+amount of careful plumbing, but it *is* plumbing. It's deterministic. Given the
+same box, it does the same correct thing, and when it's wrong you can usually
+see exactly which function was wrong.
+
+The half I kept reaching for is the part that decides *what to do next* — the
+`--exploit` chains and the `--agent` loop. That's where I hit the wall, and I
+hit it repeatedly:
+
+- **Exploit chains don't generalize.** Every one I wrote worked on exactly the
+  box it was written against. The last stretch of this repo's history is me
+  chasing a single application's login flow, then its upload handler, then its
+  file parser, patching each break as it appeared. Real targets vary in ways the
+  code can't anticipate: a login form that posts one extra token, a lockout
+  policy that turns a credential list into a self-inflicted DoS, a docroot that
+  isn't where the server said it was. Each fix made the tool better at one box
+  and no better at the next one. That's not a bug I can grind out. It's the
+  shape of the problem.
+- **Automating judgement is a research problem, not a scripting problem.** The
+  thing that actually makes an operator good is holding a messy, partial picture
+  in their head and picking the one thread worth pulling. Encoding that means
+  either an enormous hand-written decision tree that rots the moment software
+  changes, or handing the wheel to a model and trusting it to run offensive
+  commands. I built a version of the second one behind an allowlist and a
+  confirmation prompt, and the more I used it, the less comfortable I was
+  shipping it as something other people would point at real machines.
+- **Safety and correctness costs scale faster than features.** A recon tool that
+  is wrong prints a bad finding. An exploitation tool that is wrong locks out
+  accounts, corrupts a target, or fires at something outside scope. Doing that
+  responsibly — scoping, rate limits, rollback, refusing to act on low-confidence
+  input — is more work than the exploitation itself, and it's work I'd have to
+  keep doing forever, for free, for anyone who ran it.
+- **And frankly: this is past my level.** I learned an enormous amount building
+  this, which was the point. But the roadmap I'd written for myself — reliable
+  generalized exploitation, autonomous chaining, safe agent execution — is the
+  kind of thing that needs a team, a lab to test against, and a depth of
+  experience I don't have yet. I could keep pushing commits at it and produce
+  something that looks more finished without being more capable. I'd rather stop
+  at a thing that honestly does what it says.
+
+**What I'm not doing:** pretending the roadmap still exists, leaving open issues
+I'll never answer, or quietly letting this drift for two years until someone
+opens a PR against dead code.
+
+### What's actually worth taking
+
+If you're here for something usable, take these — they're the parts I'm still
+happy with:
+
+- The **adaptive enumeration engine** (`scryer/core/engine.py`) and the feedback
+  loop where a TLS SAN or a redirect becomes a new vhost to re-probe.
+- The **`confirmed` / `potential` confidence split**. Never inflating an
+  inference into an observation is the design decision I'd keep in anything I
+  build next.
+- **Content-similarity soft-404 detection** in the web discovery module, which
+  beats size-based filtering on catch-all servers by a wide margin.
+- The **external-tool orchestration layer** (`core/tooling.py`) — use the real
+  tool when it's installed, fall back to pure Python when it isn't, never die on
+  a bare shell.
+- The **[`notes/`](notes/) cheat sheets**, which are plain Markdown, have no
+  dependencies, and are the single most useful thing in this repo per byte.
+
+### If you want to carry it forward
+
+Fork it. You don't need to ask, and I'd rather you fork than wait on me. The
+things I'd tell you before you start:
+
+1. Keep the recon half and the exploitation half separate. The recon half is
+   solid and doesn't deserve to be dragged down by the other one.
+2. Don't write per-application exploit chains unless you have a lab where you
+   can regression-test every one of them on every change. I didn't, and that's
+   most of why this ended here.
+3. Treat `--agent` as a research prototype, not a feature.
+
+---
+
+*Everything below is the original README, kept as-is for reference. It describes
+the tool accurately; just read it knowing nothing further is coming.*
+
+---
+
+## scryer — what it does
+
 **Deep, adaptive recon toolkit for CTF and lab environments** (Hack The Box,
 TryHackMe, VulnHub, OSCP-style boxes).
 
